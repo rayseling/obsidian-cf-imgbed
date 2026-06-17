@@ -35,6 +35,11 @@ export interface CFImageBedSettings {
 	enableNetworkImageUpload: boolean;
 	enableExcalidrawUpload: boolean;
 	excludedImageDomains: string[];
+
+	// 自动上传配置（AI 通过 CLI 写入 / Web Clip 等外部写入时自动转存图床）
+	enableAutoUpload: boolean;
+	autoUploadDebounceMs: number; // 文件改动后等待落定的防抖毫秒
+	autoUploadFolders: string; // 逗号分隔的监听文件夹；留空 = 全库
 	
 	// 用户体验配置
 	showUploadProgress: boolean;
@@ -84,6 +89,11 @@ export const DEFAULT_SETTINGS: CFImageBedSettings = {
 	enableNetworkImageUpload: false,
 	enableExcalidrawUpload: true,
 	excludedImageDomains: [],
+
+	// 自动上传配置
+	enableAutoUpload: false,
+	autoUploadDebounceMs: 2000,
+	autoUploadFolders: '',
 	
 	// 用户体验配置
 	showUploadProgress: true,
