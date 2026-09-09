@@ -534,6 +534,49 @@ export class CFImageBedSettingTab extends PluginSettingTab {
 					this.display();
 				}));
 
+		new Setting(container)
+			.setName(this.i18n.t('settings.advanced.enableAutoUpload.name'))
+			.setDesc(this.i18n.t('settings.advanced.enableAutoUpload.desc'))
+			.addToggle((toggle: ToggleComponent) => toggle
+				.setValue(this.plugin.settings.enableAutoUpload)
+				.onChange(async (value: boolean) => {
+					this.plugin.settings.enableAutoUpload = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(container)
+			.setName(this.i18n.t('settings.advanced.autoUploadFolders.name'))
+			.setDesc(this.i18n.t('settings.advanced.autoUploadFolders.desc'))
+			.addText((text) => text
+				.setPlaceholder(this.i18n.t('settings.advanced.autoUploadFolders.placeholder'))
+				.setValue(this.plugin.settings.autoUploadFolders)
+				.onChange(async (value: string) => {
+					this.plugin.settings.autoUploadFolders = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(container)
+			.setName(this.i18n.t('settings.advanced.autoUploadWholeVault.name'))
+			.setDesc(this.i18n.t('settings.advanced.autoUploadWholeVault.desc'))
+			.addToggle((toggle: ToggleComponent) => toggle
+				.setValue(this.plugin.settings.autoUploadWholeVault)
+				.onChange(async (value: boolean) => {
+					this.plugin.settings.autoUploadWholeVault = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(container)
+			.setName(this.i18n.t('settings.advanced.autoUploadDebounceMs.name'))
+			.setDesc(this.i18n.t('settings.advanced.autoUploadDebounceMs.desc'))
+			.addText((text) => text
+				.setPlaceholder(this.i18n.t('settings.advanced.autoUploadDebounceMs.placeholder'))
+				.setValue(String(this.plugin.settings.autoUploadDebounceMs))
+				.onChange(async (value: string) => {
+					const parsed = parseInt(value, 10);
+					this.plugin.settings.autoUploadDebounceMs = Number.isFinite(parsed) && parsed > 0 ? parsed : 2000;
+					await this.plugin.saveSettings();
+				}));
+
 		const autoExcludedDomains = getOwnImageBedHostnames(
 			this.plugin.settings.apiUrl,
 			this.plugin.settings.customReturnBaseUrl
