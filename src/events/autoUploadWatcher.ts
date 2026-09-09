@@ -4,12 +4,12 @@ import { CFImageBedSettings } from '../types';
 import { I18n } from '../utils/i18n';
 import { ConfirmModal } from '../ui/confirmModal';
 
-const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif', 'apng', 'heic', 'heif', 'ico']);
+import { AutoUploadScope, isPathInScope, resolveAutoUploadScope } from '../utils/autoUploadScope';
 
-export interface AutoUploadScope {
-	wholeVault: boolean;
-	folders: string[];
-}
+export { isPathInScope, resolveAutoUploadScope };
+export type { AutoUploadScope };
+
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif', 'apng', 'heic', 'heif', 'ico']);
 
 interface FileState {
 	timer: ReturnType<typeof setTimeout> | null;
@@ -22,25 +22,6 @@ interface QueueItem {
 	path: string;
 	/** 手动「扫描并迁移」命令排队的任务，不受「图片自动上云」开关约束。 */
 	manual: boolean;
-}
-
-/** 解析监听范围：未配置文件夹且未开启「整个库」时返回 null（= 不监听）。 */
-export function resolveAutoUploadScope(settings: Pick<CFImageBedSettings, 'autoUploadFolders' | 'autoUploadWholeVault'>): AutoUploadScope | null {
-	if (settings.autoUploadWholeVault) {
-		return { wholeVault: true, folders: [] };
-	}
-	const folders = (settings.autoUploadFolders || '')
-		.split(',')
-		.map((folder) => folder.trim().replace(/^\/+|\/+$/g, ''))
-		.filter((folder) => folder.length > 0);
-	return folders.length > 0 ? { wholeVault: false, folders } : null;
-}
-
-export function isPathInScope(path: string, scope: AutoUploadScope): boolean {
-	if (scope.wholeVault) {
-		return true;
-	}
-	return scope.folders.some((folder) => path === folder || path.startsWith(folder + '/'));
 }
 
 /**

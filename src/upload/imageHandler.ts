@@ -11,6 +11,7 @@ import {
 	extractPlainImageUrlReferences
 } from '../utils/imageReferences';
 import { getEffectiveExcludedDomains, isUrlExcluded } from '../utils/domainUtils';
+import { isAutoUploadActiveFor } from '../utils/autoUploadScope';
 
 interface TextReplacement {
 	index: number;
@@ -459,6 +460,8 @@ export class ImageHandler {
 
 		const imageUrl = await this.uploadService.uploadImage(file, { noteFile });
 		if (!imageUrl) {
+			// 粘贴/拖入的图片只存在于内存里，上传失败会直接丢图：暂存到附件目录并插入本地链接，之后再补传
+			await this.stashFailedUpload(file, targetEditor, noteFile);
 			return;
 		}
 
@@ -467,6 +470,39 @@ export class ImageHandler {
 			new Notice(
 				this.i18n?.t('notices.uploadSuccess', { url: imageUrl }) || `Image uploaded successfully: ${imageUrl}`,
 				(settings.notificationDuration ?? 5) * 1000
+			);
+		}
+	}
+
+	/**
+	 * 上传失败时把内存中的图片写进库（附件目录），并在编辑器里插入本地嵌入链接，避免丢图。
+	 * 若自动上云已开启且目标笔记在监听范围内，会提示稍后自动补传；否则提示需手动处理。
+	 * 暂存本身失败时明确报错，绝不显示成功。
+	 */
+	private async stashFailedUpload(file: File, editor: Editor, noteFile: TFile | null): Promise<void> {
+		const settings = this.getSettings?.();
+		const duration = (settings?.notificationDuration ?? 5) * 1000;
+		try {
+			const fileName = this.sanitizeFileName(file.name || 'image.png');
+			const targetPath = await this.app.fileManager.getAvailablePathForAttachment(fileName, noteFile?.path ?? '');
+			const created = await this.app.vault.createBinary(targetPath, await file.arrayBuffer());
+			const link = this.app.fileManager.generateMarkdownLink(created, noteFile?.path ?? '');
+			editor.replaceSelection(link.startsWith('!') ? link : `!${link}`);
+
+			const willAutoRetry = Boolean(settings && noteFile && isAutoUploadActiveFor(settings, noteFile.path));
+			new Notice(
+				willAutoRetry
+					? (this.i18n?.t('notices.uploadFailedStashedAuto', { path: created.path })
+						|| `Upload failed; image saved to ${created.path} and will be uploaded automatically later`)
+					: (this.i18n?.t('notices.uploadFailedStashedManual', { path: created.path })
+						|| `Upload failed; image saved to ${created.path}. Run "upload current note images" later`),
+				duration
+			);
+		} catch (error) {
+			console.error('CF ImageBed: failed to stash image after upload failure:', error);
+			new Notice(
+				this.i18n?.t('notices.uploadFailedStashFailed') || 'Upload failed and the image could not be saved locally',
+				duration
 			);
 		}
 	}
