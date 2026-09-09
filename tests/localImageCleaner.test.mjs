@@ -7,8 +7,8 @@ import test, { after } from 'node:test';
 import { build } from 'esbuild';
 
 const obsidianStub = `
-export class TFile { constructor(p, mtime = 1) { this.path = p; this.name = p.split('/').pop(); this.extension = this.name.split('.').pop(); this.stat = { mtime }; } }
-export class MarkdownView { constructor(content) { this.editor = { getValue: () => content }; } }
+export class TFile { constructor(p, mtime = 1, size = 0) { this.path = p; this.name = p.split('/').pop(); this.extension = this.name.split('.').pop(); this.stat = { mtime, size }; } }
+export class MarkdownView { constructor(content, file = null) { this.editor = { getValue: () => content }; this.file = file; } }
 export class Notice { constructor(message) { (globalThis.__notices ??= []).push(String(message)); } }
 export const requestUrl = () => { throw new Error('requestUrl must be injected'); };
 `;
@@ -69,13 +69,22 @@ function createApp() {
 		trashed: [],
 		leaves: [],
 		vault: {
-			addBinary(p, bytes) { const file = new TFile(p); entries.set(p, { file, bytes: Uint8Array.from(bytes) }); return file; },
+			addBinary(p, bytes) {
+				const existing = entries.get(p);
+				const file = existing?.file ?? new TFile(p, 1, bytes.length);
+				if (existing) { file.stat.mtime++; file.stat.size = bytes.length; }
+				entries.set(p, { file, bytes: Uint8Array.from(bytes) });
+				return file;
+			},
 			addText(p, text, mtime = 1) { const file = new TFile(p, mtime); entries.set(p, { file, text }); return file; },
 			setText(p, text) { const entry = entries.get(p); entry.text = text; entry.file.stat.mtime++; },
 			getFiles: () => Array.from(entries.values()).map((entry) => entry.file),
 			getAbstractFileByPath: (p) => entries.get(p)?.file ?? null,
 			async readBinary(file) { return entries.get(file.path).bytes.buffer.slice(0); },
-			async cachedRead(file) { return entries.get(file.path).text ?? ''; }
+			async cachedRead(file) {
+				app.onCachedRead?.(file);
+				return entries.get(file.path).text ?? '';
+			}
 		},
 		metadataCache: {
 			resolvedLinks: {},
@@ -85,7 +94,7 @@ function createApp() {
 			get listenerCount() { return resolveHandlers.size; }
 		},
 		workspace: {
-			getLeavesOfType: () => app.leaves
+			iterateAllLeaves(callback) { for (const leaf of app.leaves) callback(leaf); }
 		},
 		fileManager: {
 			async trashFile(file) { app.trashed.push(file.path); entries.delete(file.path); }
@@ -101,12 +110,18 @@ async function indexImage(index, settings, bytes, src) {
 	});
 }
 
-function createFetcher({ status = 200, contentType = 'image/png', onCall } = {}) {
+/** 默认 HEAD/GET 都返回 200 image/png；perMethod 可为某个方法单独指定 status / contentType / body。 */
+function createFetcher({ status = 200, contentType = 'image/png', onCall, perMethod = {} } = {}) {
 	const calls = [];
 	const fetcher = async (request) => {
 		calls.push(request);
 		onCall?.(request);
-		return { status, headers: contentType ? { 'content-type': contentType } : {} };
+		const spec = { status, contentType, body: undefined, ...(perMethod[request.method] ?? {}) };
+		return {
+			status: spec.status,
+			headers: spec.contentType ? { 'content-type': spec.contentType } : {},
+			arrayBuffer: spec.body ? Uint8Array.from(spec.body).buffer : undefined
+		};
 	};
 	fetcher.calls = calls;
 	return fetcher;
@@ -264,4 +279,92 @@ test('orphan scan lists only indexed, unreferenced images; cleanup re-checks eac
 	assert.deepEqual(report, { deleted: ['attachments/pic.png'], kept: [] });
 	assert.equal(ctx.app.vault.getAbstractFileByPath('attachments/used.png'), referenced);
 	assert.ok(ctx.app.vault.getAbstractFileByPath('attachments/unknown.png'));
+});
+
+test('percent-encoded and entity-encoded references to a file name with spaces block deletion', async () => {
+	for (const html of ['<img src="attachments/pic%201.png">', '<img src="attachments/pic&#32;1.png">', '![x](attachments/pic%201.png)']) {
+		const ctx = await setup();
+		ctx.app.vault.addBinary('attachments/pic 1.png', [1, 2, 3, 4]); // 与 pic.png 同字节
+		ctx.app.vault.addText('notes/html.md', html);
+		const image = ctx.app.vault.getAbstractFileByPath('attachments/pic 1.png');
+		const report = await ctx.cleaner.cleanupOrphans([{ file: image, src: '/file/pic.png', url: 'http://img.example:7658/file/pic.png' }]);
+		assert.deepEqual(report.kept, [{ path: 'attachments/pic 1.png', reason: 'referenced' }], html);
+		assert.deepEqual(ctx.app.trashed, []);
+	}
+});
+
+test('the file name inside the alt of the rewritten remote image does not count as a reference', async () => {
+	const ctx = await setup();
+	// 真实改写结果：![[pic.png]] → ![pic.png](https://…/pic.png)，另有一处 <img src="http…/pic.png">
+	ctx.app.vault.setText('notes/a.md', '![pic.png](http://img.example:7658/file/pic.png)\n<img src="http://img.example:7658/file/pic.png" alt="pic.png">');
+	const report = await runAfterWriteBack(ctx);
+	assert.deepEqual(report, { deleted: ['attachments/pic.png'], kept: [] });
+});
+
+test('open non-Markdown views are protected: readable view data is searched, unreadable note/canvas views block', async () => {
+	const canvasView = await setup();
+	canvasView.app.leaves = [{ view: { file: new TFile('boards/open.canvas'), getViewData: () => JSON.stringify({ nodes: [{ type: 'file', file: 'attachments/pic.png' }] }) } }];
+	let report = await runAfterWriteBack(canvasView);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'unsaved-edit' }]);
+
+	const opaque = await setup();
+	opaque.app.leaves = [{ view: { file: new TFile('boards/opaque.canvas') } }];
+	report = await runAfterWriteBack(opaque);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'unsaved-edit' }]);
+
+	const viewingImage = await setup();
+	viewingImage.app.leaves = [{ view: { file: viewingImage.image } }];
+	report = await runAfterWriteBack(viewingImage);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'unsaved-edit' }]);
+
+	const harmless = await setup();
+	harmless.app.leaves = [
+		{ view: { file: new TFile('docs/manual.pdf') } },
+		{ view: { file: new TFile('boards/other.canvas'), getViewData: () => JSON.stringify({ nodes: [] }) } },
+		{ view: new MarkdownView('![pic.png](http://img.example:7658/file/pic.png)') }
+	];
+	report = await runAfterWriteBack(harmless);
+	assert.deepEqual(report.deleted, ['attachments/pic.png']);
+});
+
+test('remote verification requires proof of an image: HEAD without content-type falls through to GET', async () => {
+	// HEAD 200 无 Content-Type，GET 返回 HTML → 保留
+	const html = await setup({ fetcher: createFetcher({ perMethod: { HEAD: { contentType: '' }, GET: { contentType: 'text/html', body: [60, 104] } } }) });
+	let report = await runAfterWriteBack(html);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'remote-unverified' }]);
+	assert.deepEqual(html.fetcher.calls.map((call) => call.method), ['HEAD', 'GET']);
+
+	// HEAD 200 无 Content-Type，GET 无 Content-Type 但响应体是 PNG 魔数 → 通过
+	const png = await setup({ fetcher: createFetcher({ perMethod: { HEAD: { contentType: '' }, GET: { contentType: '', body: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a] } } }) });
+	report = await runAfterWriteBack(png);
+	assert.deepEqual(report.deleted, ['attachments/pic.png']);
+
+	// HEAD 200 无 Content-Type，GET 无 Content-Type 且响应体为空 → 保留
+	const empty = await setup({ fetcher: createFetcher({ perMethod: { HEAD: { contentType: '' }, GET: { contentType: '' } } }) });
+	report = await runAfterWriteBack(empty);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'remote-unverified' }]);
+});
+
+test('an image overwritten during the final reference scan is not deleted', async () => {
+	let ctxRef = null;
+	const fetcher = createFetcher({
+		// 远端验证期间另一篇笔记被修改 → 第二轮全库扫描必须重读它（绕过 mtime 缓存）
+		onCall: () => ctxRef.app.vault.setText('notes/other.md', 'edited')
+	});
+	const ctx = await setup({ fetcher });
+	ctxRef = ctx;
+	ctx.app.vault.addText('notes/other.md', 'nothing');
+	let overwritten = false;
+	ctx.app.onCachedRead = (file) => {
+		// 第二轮扫描重读 other.md 的那一刻，同路径图片被换成了未上传的新内容
+		if (file.path === 'notes/other.md' && ctx.fetcher.calls.length > 0 && !overwritten) {
+			overwritten = true;
+			ctx.app.vault.addBinary('attachments/pic.png', [9, 9, 9, 9, 9]);
+		}
+	};
+	const report = await runAfterWriteBack(ctx);
+	assert.equal(overwritten, true, 'the overwrite must happen during the final scan');
+	assert.equal(report.deleted.length, 0);
+	assert.ok(['not-in-index', 'changed'].includes(report.kept[0].reason), report.kept[0].reason);
+	assert.ok(ctx.app.vault.getAbstractFileByPath('attachments/pic.png'));
 });
