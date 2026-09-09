@@ -4,6 +4,8 @@ import { ClientCompressor } from '../utils/clientCompressor';
 import { ClientWatermark } from '../utils/clientWatermark';
 import { buildCustomUploadFile, resolveTemplatePath } from '../utils/templateResolver';
 import { I18n, resolveLanguage } from '../utils/i18n';
+import { sha256Hex } from '../utils/contentHash';
+import { UploadIndex, buildProcessingPolicy, buildUploadIndexKey, buildUploadNamespace } from './uploadIndex';
 
 interface UploadRuntimeConfig {
 	file: File;
@@ -12,12 +14,31 @@ interface UploadRuntimeConfig {
 	backupPath: string;
 }
 
+export interface UploadImageOptions {
+	showErrorNotice?: boolean;
+	noteFile?: TFile | null;
+	/** 跳过去重索引，强制重新上传（用于单条失效重传）。 */
+	bypassDedupe?: boolean;
+}
+
+export interface UploadOutcome {
+	/** 按当前返回格式拼好的链接。 */
+	url: string;
+	/** 服务端返回的原始 src。 */
+	src: string;
+	/** true = 复用了索引里已上传的同一张图片，没有发起新上传。 */
+	reused: boolean;
+}
+
 export class UploadService {
 	private i18n = new I18n(resolveLanguage(getLanguage()));
+	/** 同一去重键的并发上传合并成一次请求。 */
+	private inFlight = new Map<string, Promise<UploadOutcome | null>>();
 
 	constructor(
 		private app: App,
-		private settings: CFImageBedSettings
+		private settings: CFImageBedSettings,
+		private uploadIndex?: UploadIndex
 	) {}
 
 	private isDevelopmentBuild(): boolean {
@@ -44,8 +65,20 @@ export class UploadService {
 
 	async uploadImage(
 		file: File,
-		options: { showErrorNotice?: boolean; noteFile?: TFile | null } = {}
+		options: UploadImageOptions = {}
 	): Promise<string | null> {
+		const outcome = await this.uploadImageDetailed(file, options);
+		return outcome?.url ?? null;
+	}
+
+	/**
+	 * 结构化上传：区分「新上传」与「复用索引」。失败返回 null，并按 options 决定是否弹提示。
+	 * 去重流程：校验 → 原始字节 SHA-256 → 查成功索引 / 合并进行中的同图请求 → 上传 → 记录索引。
+	 */
+	async uploadImageDetailed(
+		file: File,
+		options: UploadImageOptions = {}
+	): Promise<UploadOutcome | null> {
 		this.syncLanguage();
 
 		if (!this.settings.apiUrl || (!this.settings.authCode && !this.settings.apiToken)) {
@@ -76,61 +109,36 @@ export class UploadService {
 				return null;
 			}
 
-			// 客户端处理（水印 + 压缩）
-			let processedFile = runtimeConfig.file;
-			
-			// 1. 添加水印
-			if (this.settings.enableWatermark && ClientWatermark.isWatermarkable(runtimeConfig.file)) {
-				this.debugLog('CF ImageBed: Starting watermark addition');
-				processedFile = await ClientWatermark.addWatermark(
-					processedFile,
-					this.settings.watermarkText,
-					this.settings.watermarkPosition,
-					this.settings.watermarkSize,
-					this.settings.watermarkOpacity
-				);
-			}
-			
-			// 2. 客户端压缩
-			if (this.settings.enableClientCompress && ClientCompressor.isCompressible(processedFile)) {
-				this.debugLog('CF ImageBed: Starting client compression');
-				processedFile = await ClientCompressor.compressImage(
-					processedFile, 
-					this.settings.targetSize, 
-					this.settings.compressThreshold
-				);
-				
-				// 显示压缩结果
-				const originalSize = ClientCompressor.formatFileSize(runtimeConfig.file.size);
-				const processedSize = ClientCompressor.formatFileSize(processedFile.size);
-				this.debugLog(`CF ImageBed: Processing complete - Original: ${originalSize}, Processed: ${processedSize}`);
+			// 内容去重：命中索引直接复用旧链接，不再发请求
+			const dedupeKey = options.bypassDedupe ? null : await this.resolveDedupeKey(runtimeConfig.file);
+			if (dedupeKey) {
+				const cached = this.uploadIndex?.get(dedupeKey);
+				if (cached) {
+					this.debugLog(`CF ImageBed: reusing already uploaded image ${cached.src}`);
+					this.notifyReused();
+					return { url: this.buildReturnUrl(cached.src), src: cached.src, reused: true };
+				}
+				const inFlight = this.inFlight.get(dedupeKey);
+				if (inFlight) {
+					const shared = await inFlight;
+					if (shared) {
+						this.notifyReused();
+						return { ...shared, reused: true };
+					}
+					// 并行的那次上传失败了，下面自己再传一次
+				}
 			}
 
-			const result = this.shouldUseChunkedUpload(processedFile)
-				? await this.chunkedUpload(processedFile, runtimeConfig)
-				: await this.simpleUpload(processedFile, runtimeConfig);
-
-			const src = this.extractSrc(result);
-			if (src) {
-				// 可选：本地备份
-				if (this.settings.enableLocalBackup && runtimeConfig.backupPath.trim()) {
-					try {
-						await this.saveLocalBackup(processedFile, runtimeConfig.backupPath);
-				} catch (e) {
-					console.warn('CF ImageBed: Local backup failed:', e);
+			const task = this.performUpload(runtimeConfig, dedupeKey);
+			if (dedupeKey) {
+				this.inFlight.set(dedupeKey, task.catch(() => null));
+			}
+			try {
+				return await task;
+			} finally {
+				if (dedupeKey) {
+					this.inFlight.delete(dedupeKey);
 				}
-				}
-				// 根据返回格式设置决定是否拼接URL
-				if (this.settings.returnFormat === 'full') {
-					// 完整链接格式，直接返回
-					return src;
-				} else {
-					// 默认格式，需要拼接基础 URL（优先使用自定义前缀，否则回退到 API URL）
-					const baseUrl = this.settings.customReturnBaseUrl?.trim() || this.settings.apiUrl;
-					return `${baseUrl}${src}`;
-				}
-			} else {
-				throw new Error(this.i18n.t('errors.serverResponseInvalid'));
 			}
 		} catch (error) {
 			console.error('CF ImageBed: Image upload failed:', error);
@@ -142,6 +150,97 @@ export class UploadService {
 				);
 			}
 			return null;
+		}
+	}
+
+	private async performUpload(runtimeConfig: UploadRuntimeConfig, dedupeKey: string | null): Promise<UploadOutcome> {
+		// 客户端处理（水印 + 压缩）
+		let processedFile = runtimeConfig.file;
+
+		// 1. 添加水印
+		if (this.settings.enableWatermark && ClientWatermark.isWatermarkable(runtimeConfig.file)) {
+			this.debugLog('CF ImageBed: Starting watermark addition');
+			processedFile = await ClientWatermark.addWatermark(
+				processedFile,
+				this.settings.watermarkText,
+				this.settings.watermarkPosition,
+				this.settings.watermarkSize,
+				this.settings.watermarkOpacity
+			);
+		}
+
+		// 2. 客户端压缩
+		if (this.settings.enableClientCompress && ClientCompressor.isCompressible(processedFile)) {
+			this.debugLog('CF ImageBed: Starting client compression');
+			processedFile = await ClientCompressor.compressImage(
+				processedFile,
+				this.settings.targetSize,
+				this.settings.compressThreshold
+			);
+
+			// 显示压缩结果
+			const originalSize = ClientCompressor.formatFileSize(runtimeConfig.file.size);
+			const processedSize = ClientCompressor.formatFileSize(processedFile.size);
+			this.debugLog(`CF ImageBed: Processing complete - Original: ${originalSize}, Processed: ${processedSize}`);
+		}
+
+		const result = this.shouldUseChunkedUpload(processedFile)
+			? await this.chunkedUpload(processedFile, runtimeConfig)
+			: await this.simpleUpload(processedFile, runtimeConfig);
+
+		const src = this.extractSrc(result);
+		if (!src) {
+			throw new Error(this.i18n.t('errors.serverResponseInvalid'));
+		}
+
+		// 只记录成功结果；写盘由索引串行化
+		if (dedupeKey && this.uploadIndex) {
+			void this.uploadIndex.set(dedupeKey, {
+				src,
+				name: runtimeConfig.file.name,
+				size: runtimeConfig.file.size,
+				uploadedAt: Date.now()
+			});
+		}
+
+		// 可选：本地备份
+		if (this.settings.enableLocalBackup && runtimeConfig.backupPath.trim()) {
+			try {
+				await this.saveLocalBackup(processedFile, runtimeConfig.backupPath);
+			} catch (e) {
+				console.warn('CF ImageBed: Local backup failed:', e);
+			}
+		}
+
+		return { url: this.buildReturnUrl(src), src, reused: false };
+	}
+
+	/** 根据返回格式设置把服务端 src 拼成最终链接（优先自定义前缀，否则回退到 API URL）。 */
+	buildReturnUrl(src: string): string {
+		if (this.settings.returnFormat === 'full' || /^https?:\/\//i.test(src)) {
+			return src;
+		}
+		const baseUrl = this.settings.customReturnBaseUrl?.trim() || this.settings.apiUrl;
+		return `${baseUrl}${src}`;
+	}
+
+	/** 去重键：原始字节 SHA-256 + 目标命名空间 + 处理策略；去重关闭或哈希失败时返回 null。 */
+	private async resolveDedupeKey(file: File): Promise<string | null> {
+		if (!this.uploadIndex || this.settings.enableUploadDedupe === false) {
+			return null;
+		}
+		try {
+			const hash = await sha256Hex(file);
+			return buildUploadIndexKey(hash, buildUploadNamespace(this.settings), buildProcessingPolicy(this.settings));
+		} catch (error) {
+			console.warn('CF ImageBed: failed to hash image, uploading without dedupe', error);
+			return null;
+		}
+	}
+
+	private notifyReused(): void {
+		if (this.settings.showUploadProgress) {
+			new Notice(this.i18n.t('notices.uploadReused'));
 		}
 	}
 

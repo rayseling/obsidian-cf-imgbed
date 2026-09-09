@@ -156,6 +156,20 @@ const translations: Record<Language, Translations> = {
 					name: '接管 Excalidraw 图片上传',
 					desc: '开启后，粘贴、拖拽或插入到 Excalidraw 的图片将上传到当前图床；关闭后由 Excalidraw 原生处理'
 				},
+				enableUploadDedupe: {
+					name: '相同图片只上传一次',
+					desc: '上传前计算图片字节的 SHA-256，之前已成功上传过的同一张图直接复用旧链接，不再重复上传。粘贴、拖拽、批量命令、Excalidraw 等所有入口共用。复用以第一次上传的位置为准；换图床/渠道或改动水印、压缩设置后会重新上传'
+				},
+				uploadIndex: {
+					name: '去重索引',
+					desc: '已记录 {count} 张上传成功的图片。索引保存在插件目录的 upload-index.json，只含哈希与链接，不含凭证。若图床上的某张图已被删除，可在此按链接移除记录后重新上传',
+					removePlaceholder: '粘贴要失效的图片链接',
+					remove: '移除该链接',
+					removed: '已从去重索引移除 {count} 条记录',
+					notFound: '去重索引中没有这个链接',
+					clear: '清空索引',
+					cleared: '去重索引已清空，之后所有图片都会重新上传一次'
+				},
 				excludedImageDomains: {
 					name: '网络图片排除域名',
 					desc: '这些域名的图片链接不会重复上传，支持逗号或换行分隔。当前 API URL 域名会自动加入排除列表',
@@ -223,6 +237,7 @@ const translations: Record<Language, Translations> = {
 			checkFileSystemPermission: '请检查浏览器权限设置，允许访问文件系统',
 			uploadingImage: '正在上传图片...',
 			uploadSuccess: '图片上传成功：{url}',
+			uploadReused: '这张图片之前已上传过，已直接复用图床链接',
 			remoteUploadSummary: '网络图片上传完成：成功 {success}，失败 {failed}',
 			remoteUploadFailedKeepOriginal: '网络图片上传失败，已保留原始内容',
 			batchUploadSummary: '当前文档图片上传完成：成功 {success}，失败 {failed}{skippedText}',
@@ -411,6 +426,20 @@ const translations: Record<Language, Translations> = {
 					name: 'Handle Excalidraw image uploads',
 					desc: 'When enabled, images pasted, dropped, or inserted into Excalidraw are uploaded to the current image bed. When disabled, Excalidraw handles them normally.'
 				},
+				enableUploadDedupe: {
+					name: 'Upload identical images only once',
+					desc: 'Hashes the image bytes (SHA-256) before uploading; an image that was already uploaded successfully reuses the existing link instead of being uploaded again. Shared by paste, drop, batch commands and Excalidraw. The first upload location wins; switching image bed/channel or changing watermark/compression settings uploads again.'
+				},
+				uploadIndex: {
+					name: 'Dedupe index',
+					desc: '{count} successfully uploaded image(s) recorded. Stored as upload-index.json in the plugin folder; contains only hashes and links, never credentials. If an image was deleted from the image bed, remove its link here to upload it again.',
+					removePlaceholder: 'Paste the image link to invalidate',
+					remove: 'Remove link',
+					removed: 'Removed {count} record(s) from the dedupe index',
+					notFound: 'That link is not in the dedupe index',
+					clear: 'Clear index',
+					cleared: 'Dedupe index cleared; every image will be uploaded once more'
+				},
 				excludedImageDomains: {
 					name: 'Excluded remote domains',
 					desc: 'Images from these domains will not be uploaded again. Separate domains with commas or new lines. The current API URL domain is always excluded automatically.',
@@ -478,6 +507,7 @@ const translations: Record<Language, Translations> = {
 			checkFileSystemPermission: 'Please check browser permissions and allow file system access',
 			uploadingImage: 'Uploading image...',
 			uploadSuccess: 'Image uploaded successfully: {url}',
+			uploadReused: 'This image was uploaded before; the existing image bed link was reused',
 			remoteUploadSummary: 'Remote image upload completed: {success} succeeded, {failed} failed',
 			remoteUploadFailedKeepOriginal: 'Remote image upload failed and original content was kept',
 			batchUploadSummary: 'Current note upload completed: {success} succeeded, {failed} failed{skippedText}',
