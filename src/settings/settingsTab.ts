@@ -501,6 +501,16 @@ export class CFImageBedSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(container)
+			.setName(this.i18n.t('settings.advanced.autoUploadWholeVault.name'))
+			.setDesc(this.i18n.t('settings.advanced.autoUploadWholeVault.desc'))
+			.addToggle((toggle: ToggleComponent) => toggle
+				.setValue(this.plugin.settings.autoUploadWholeVault)
+				.onChange(async (value: boolean) => {
+					this.plugin.settings.autoUploadWholeVault = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(container)
 			.setName(this.i18n.t('settings.advanced.autoUploadDebounceMs.name'))
 			.setDesc(this.i18n.t('settings.advanced.autoUploadDebounceMs.desc'))
 			.addText((text) => text

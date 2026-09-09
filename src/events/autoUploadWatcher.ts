@@ -1,25 +1,73 @@
-import { Notice, Plugin, TAbstractFile, TFile, debounce } from 'obsidian';
+import { Notice, Plugin, TAbstractFile, TFile } from 'obsidian';
 import { ImageHandler } from '../upload/imageHandler';
 import { CFImageBedSettings } from '../types';
 import { I18n } from '../utils/i18n';
+import { ConfirmModal } from '../ui/confirmModal';
 
-type DebouncedFn = ReturnType<typeof debounce>;
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif', 'apng', 'heic', 'heif', 'ico']);
+
+export interface AutoUploadScope {
+	wholeVault: boolean;
+	folders: string[];
+}
+
+interface FileState {
+	timer: ReturnType<typeof setTimeout> | null;
+	processing: boolean;
+	/** 处理期间又收到改动 / 条件写回被拒绝 → 本轮结束后重新排队。 */
+	rerun: boolean;
+}
+
+interface QueueItem {
+	path: string;
+	/** 手动「扫描并迁移」命令排队的任务，不受「图片自动上云」开关约束。 */
+	manual: boolean;
+}
+
+/** 解析监听范围：未配置文件夹且未开启「整个库」时返回 null（= 不监听）。 */
+export function resolveAutoUploadScope(settings: Pick<CFImageBedSettings, 'autoUploadFolders' | 'autoUploadWholeVault'>): AutoUploadScope | null {
+	if (settings.autoUploadWholeVault) {
+		return { wholeVault: true, folders: [] };
+	}
+	const folders = (settings.autoUploadFolders || '')
+		.split(',')
+		.map((folder) => folder.trim().replace(/^\/+|\/+$/g, ''))
+		.filter((folder) => folder.length > 0);
+	return folders.length > 0 ? { wholeVault: false, folders } : null;
+}
+
+export function isPathInScope(path: string, scope: AutoUploadScope): boolean {
+	if (scope.wholeVault) {
+		return true;
+	}
+	return scope.folders.some((folder) => path === folder || path.startsWith(folder + '/'));
+}
 
 /**
- * 自动上传监听器：监听 vault 的 create / modify 事件，对「从外部写入磁盘」的
- * Markdown 笔记（如 AI 通过 CLI 写文件、Web Clip 存网页）自动检查其中的本地/远程
- * 图片，转存到图床并改写链接。
+ * 图片自动上云监听器。
+ *
+ * 监听 vault 的 create / modify（无法区分外部写入与编辑器保存，两者一视同仁），
+ * 对监听范围内的 Markdown 笔记：上传其中的库内图片 / 远程图片，改写链接。
  *
  * 安全设计：
- *  - 仅在 onLayoutReady 之后注册（见 main.ts），避免启动时全库 create 事件风暴。
- *  - 每个文件独立防抖，等写入落定再处理，绝不动到正在写的内容。
- *  - processing 集合 + 幂等性（转存后图片已在图床域、被排除域过滤，二次扫描为 0）
- *    双重断环，杜绝「自己改写又触发 modify」的死循环。
- *  - vault.process 原子写回，且仅当磁盘内容仍等于所处理快照时才覆盖。
+ *  - 范围明确：必须配置文件夹或显式开启「整个库」，否则不处理任何笔记。
+ *  - 每文件防抖 + 全局并发上限，批量写入不会打爆图床。
+ *  - 处理中再次改动 → 标记 rerun，本轮结束后重新排队；条件写回被拒绝也重跑，绝不覆盖用户新内容。
+ *  - 自动模式只读库内图片（allowAbsolutePaths: false）。
+ *  - 库内找不到的图片（笔记先落盘、图片后落盘）记入等待表，图片 create 时唤醒对应笔记。
+ *  - 幂等：已上云的链接在排除域名内，二次扫描为 0，不会自我循环。
+ *  - unload 后丢弃所有迟到结果，不再写文件。
  */
 export class AutoUploadWatcher {
-	private processing = new Set<string>();
-	private debouncers = new Map<string, DebouncedFn>();
+	static maxConcurrent = 2;
+	static minDebounceMs = 500;
+
+	private states = new Map<string, FileState>();
+	private queue: QueueItem[] = [];
+	private queued = new Set<string>();
+	private active = 0;
+	private waitingForImage = new Map<string, Set<string>>();
+	private disposed = false;
 
 	constructor(
 		private plugin: Plugin,
@@ -28,80 +76,294 @@ export class AutoUploadWatcher {
 		private i18n: I18n
 	) {}
 
-	/** 在 workspace.onLayoutReady 回调里调用，避免启动事件风暴。 */
+	/** 在 workspace.onLayoutReady 回调里调用：注册事件并对监听范围补扫一次。 */
 	register(): void {
 		const vault = this.plugin.app.vault;
 		this.plugin.registerEvent(vault.on('create', (file) => this.onVaultChange(file)));
 		this.plugin.registerEvent(vault.on('modify', (file) => this.onVaultChange(file)));
+		this.plugin.registerEvent(vault.on('rename', (file, oldPath) => this.onRename(file, oldPath)));
+		this.plugin.registerEvent(vault.on('delete', (file) => this.onDelete(file)));
+
+		const settings = this.getSettings();
+		const scope = settings?.enableAutoUpload ? resolveAutoUploadScope(settings) : null;
+		if (scope) {
+			this.enqueueScope(scope, false);
+		}
+	}
+
+	unload(): void {
+		this.disposed = true;
+		for (const state of this.states.values()) {
+			if (state.timer) {
+				clearTimeout(state.timer);
+			}
+		}
+		this.states.clear();
+		this.queue = [];
+		this.queued.clear();
+		this.waitingForImage.clear();
+	}
+
+	/** 命令：统计范围内待转存图片 → 确认 → 排队处理。未配置范围时按整个库处理，并在对话框里说明。 */
+	async scanAndMigrate(): Promise<void> {
+		const settings = this.getSettings();
+		const scope = resolveAutoUploadScope(settings) ?? { wholeVault: true, folders: [] };
+		const scopeLabel = scope.wholeVault
+			? this.i18n.t('autoUpload.scopeWholeVault')
+			: this.i18n.t('autoUpload.scopeFolders', { folders: scope.folders.join(', ') });
+
+		const summary = await this.countScope(scope);
+		if (summary.images === 0) {
+			new Notice(this.i18n.t('autoUpload.scanNothing', { scope: scopeLabel }));
+			return;
+		}
+
+		new ConfirmModal(this.plugin.app, {
+			title: this.i18n.t('autoUpload.scanConfirmTitle'),
+			message: this.i18n.t('autoUpload.scanConfirmMessage', {
+				scope: scopeLabel,
+				notes: summary.notes,
+				images: summary.images
+			}),
+			confirmText: this.i18n.t('autoUpload.confirm'),
+			cancelText: this.i18n.t('autoUpload.cancel'),
+			onConfirm: () => {
+				const queuedNotes = this.enqueueScope(scope, true);
+				new Notice(this.i18n.t('autoUpload.scanQueued', { notes: queuedNotes }));
+			}
+		}).open();
+	}
+
+	/** 只统计，不上传。 */
+	async countScope(scope: AutoUploadScope): Promise<{ notes: number; images: number }> {
+		let notes = 0;
+		let images = 0;
+		for (const file of this.listScopeFiles(scope)) {
+			const content = await this.plugin.app.vault.cachedRead(file);
+			const count = this.imageHandler.countUploadableImages(content);
+			if (count > 0) {
+				notes++;
+				images += count;
+			}
+		}
+		return { notes, images };
+	}
+
+	/** 把范围内所有笔记排队，返回排队数。 */
+	enqueueScope(scope: AutoUploadScope, manual: boolean): number {
+		const files = this.listScopeFiles(scope);
+		for (const file of files) {
+			this.enqueue(file.path, manual);
+		}
+		return files.length;
+	}
+
+	private listScopeFiles(scope: AutoUploadScope): TFile[] {
+		return this.plugin.app.vault.getMarkdownFiles()
+			.filter((file) => this.isWatchableNote(file) && isPathInScope(file.path, scope));
+	}
+
+	private isWatchableNote(file: TFile): boolean {
+		// Excalidraw 绘图也是 .md，但其图片由 Excalidraw 集成单独处理
+		return file.extension === 'md' && !file.name.toLowerCase().endsWith('.excalidraw.md');
 	}
 
 	private onVaultChange(file: TAbstractFile): void {
+		if (this.disposed || !(file instanceof TFile)) {
+			return;
+		}
 		const settings = this.getSettings();
 		if (!settings?.enableAutoUpload) {
 			return;
 		}
-		if (!(file instanceof TFile) || file.extension !== 'md') {
+		if (IMAGE_EXTENSIONS.has(file.extension.toLowerCase())) {
+			this.onImageArrived(file);
 			return;
 		}
-		if (!this.isWatchedPath(file.path, settings)) {
+		if (!this.isWatchableNote(file)) {
 			return;
 		}
-		if (this.processing.has(file.path)) {
+		const scope = resolveAutoUploadScope(settings);
+		if (!scope || !isPathInScope(file.path, scope)) {
 			return;
 		}
-
-		const delay = Math.max(500, settings.autoUploadDebounceMs ?? 2000);
-		let debounced = this.debouncers.get(file.path);
-		if (!debounced) {
-			debounced = debounce(() => {
-				void this.processFile(file.path);
-			}, delay, true);
-			this.debouncers.set(file.path, debounced);
-		}
-		debounced();
+		this.schedule(file.path);
 	}
 
-	private isWatchedPath(path: string, settings: CFImageBedSettings): boolean {
-		const folders = (settings.autoUploadFolders || '')
-			.split(',')
-			.map((f) => f.trim().replace(/^\/+|\/+$/g, ''))
-			.filter((f) => f.length > 0);
-		if (folders.length === 0) {
-			return true; // 未配置 = 全库
+	private onRename(file: TAbstractFile, oldPath: string): void {
+		const state = this.states.get(oldPath);
+		if (state) {
+			if (state.timer) {
+				clearTimeout(state.timer);
+			}
+			this.states.delete(oldPath);
 		}
-		return folders.some((folder) => path === folder || path.startsWith(folder + '/'));
+		this.queue = this.queue.filter((item) => item.path !== oldPath);
+		this.queued.delete(oldPath);
+		// 改名后的文件按新路径重新走一遍范围判断
+		this.onVaultChange(file);
 	}
 
-	private async processFile(path: string): Promise<void> {
-		if (this.processing.has(path)) {
+	private onDelete(file: TAbstractFile): void {
+		const state = this.states.get(file.path);
+		if (state?.timer) {
+			clearTimeout(state.timer);
+		}
+		this.states.delete(file.path);
+		this.queue = this.queue.filter((item) => item.path !== file.path);
+		this.queued.delete(file.path);
+	}
+
+	private onImageArrived(image: TFile): void {
+		const key = image.name.toLowerCase();
+		const notes = this.waitingForImage.get(key);
+		if (!notes) {
 			return;
 		}
-		const file = this.plugin.app.vault.getAbstractFileByPath(path);
+		this.waitingForImage.delete(key);
+		for (const notePath of notes) {
+			this.schedule(notePath);
+		}
+	}
+
+	private waitForImage(referencePath: string, notePath: string): void {
+		const key = imageBasename(referencePath);
+		if (!key) {
+			return;
+		}
+		let notes = this.waitingForImage.get(key);
+		if (!notes) {
+			notes = new Set<string>();
+			this.waitingForImage.set(key, notes);
+		}
+		notes.add(notePath);
+	}
+
+	private getState(path: string): FileState {
+		let state = this.states.get(path);
+		if (!state) {
+			state = { timer: null, processing: false, rerun: false };
+			this.states.set(path, state);
+		}
+		return state;
+	}
+
+	private debounceDelay(): number {
+		const settings = this.getSettings();
+		return Math.max(AutoUploadWatcher.minDebounceMs, settings?.autoUploadDebounceMs ?? 2000);
+	}
+
+	private schedule(path: string): void {
+		if (this.disposed) {
+			return;
+		}
+		const state = this.getState(path);
+		if (state.processing) {
+			state.rerun = true;
+			return;
+		}
+		if (state.timer) {
+			clearTimeout(state.timer);
+		}
+		state.timer = setTimeout(() => {
+			state.timer = null;
+			this.enqueue(path, false);
+		}, this.debounceDelay());
+	}
+
+	private enqueue(path: string, manual: boolean): void {
+		if (this.disposed || this.queued.has(path)) {
+			return;
+		}
+		this.queued.add(path);
+		this.queue.push({ path, manual });
+		this.pump();
+	}
+
+	private pump(): void {
+		while (!this.disposed && this.active < AutoUploadWatcher.maxConcurrent && this.queue.length > 0) {
+			const item = this.queue.shift() as QueueItem;
+			this.queued.delete(item.path);
+			this.active++;
+			void this.processFile(item).finally(() => {
+				this.active--;
+				this.pump();
+			});
+		}
+	}
+
+	private async processFile(item: QueueItem): Promise<void> {
+		if (this.disposed) {
+			return;
+		}
+		const settings = this.getSettings();
+		if (!item.manual && !settings?.enableAutoUpload) {
+			return;
+		}
+		const vault = this.plugin.app.vault;
+		const file = vault.getAbstractFileByPath(item.path);
 		if (!(file instanceof TFile)) {
 			return;
 		}
 
-		this.processing.add(path);
+		const state = this.getState(item.path);
+		state.processing = true;
+		state.rerun = false;
 		try {
-			const original = await this.plugin.app.vault.read(file);
-			const result = await this.imageHandler.uploadImagesInText(original, file, file.path);
+			const original = await vault.read(file);
+			const result = await this.imageHandler.uploadImagesInText(original, file, file.path, {
+				allowAbsolutePaths: false
+			});
+			if (this.disposed) {
+				return;
+			}
 			if (result.success > 0) {
-				// 原子写回：仅当磁盘内容仍等于刚处理的快照时才覆盖，避免覆盖期间的新改动。
-				await this.plugin.app.vault.process(file, (current) =>
+				// 条件写回：仅当磁盘内容仍等于处理快照时才覆盖；否则保留用户新内容并重跑。
+				const written = await vault.process(file, (current) =>
 					current === original ? result.content : current
 				);
-				const settings = this.getSettings();
-				if (settings?.showUploadProgress) {
-					new Notice(this.i18n.t('notices.autoUploadSummary', {
-						count: String(result.success),
-						file: file.name
-					}));
+				if (written === result.content) {
+					// 写回成功：期间收到的 modify 事件来自我们自己的写入，不需要重跑。
+					// 用户若在上传期间改过内容，条件写回会失败并走下面的 rerun 分支。
+					state.rerun = false;
+					if (settings?.showUploadProgress) {
+						new Notice(this.i18n.t('notices.autoUploadSummary', {
+							count: String(result.success),
+							file: file.name
+						}));
+					}
+				} else {
+					state.rerun = true;
 				}
+			}
+			for (const unresolved of result.unresolvedLocal) {
+				this.waitForImage(unresolved, file.path);
 			}
 		} catch (error) {
 			console.error('CF ImageBed auto-upload failed:', error);
 		} finally {
-			this.processing.delete(path);
+			state.processing = false;
+			if (this.disposed) {
+				return;
+			}
+			if (state.rerun) {
+				state.rerun = false;
+				this.schedule(item.path);
+			} else if (!state.timer) {
+				this.states.delete(item.path);
+			}
 		}
 	}
+}
+
+function imageBasename(referencePath: string): string {
+	let decoded = referencePath;
+	try {
+		decoded = decodeURIComponent(referencePath);
+	} catch {
+		// 保留原文
+	}
+	const cleaned = decoded.replace(/\\/g, '/').split('?')[0].split('#')[0].split('|')[0].trim();
+	const segments = cleaned.split('/');
+	return (segments[segments.length - 1] || '').toLowerCase();
 }

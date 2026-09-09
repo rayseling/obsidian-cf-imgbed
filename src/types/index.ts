@@ -36,10 +36,11 @@ export interface CFImageBedSettings {
 	enableExcalidrawUpload: boolean;
 	excludedImageDomains: string[];
 
-	// 自动上传配置（AI 通过 CLI 写入 / Web Clip 等外部写入时自动转存图床）
+	// 图片自动上云：监听笔记改动（外部写入与编辑器保存都会触发），把图片转存到图床并改写链接
 	enableAutoUpload: boolean;
 	autoUploadDebounceMs: number; // 文件改动后等待落定的防抖毫秒
-	autoUploadFolders: string; // 逗号分隔的监听文件夹；留空 = 全库
+	autoUploadFolders: string; // 逗号分隔的监听文件夹；留空且未开启 autoUploadWholeVault 时不监听任何笔记
+	autoUploadWholeVault: boolean; // 显式开启才监听整个库（默认关，风险见设置说明）
 	
 	// 用户体验配置
 	showUploadProgress: boolean;
@@ -90,10 +91,11 @@ export const DEFAULT_SETTINGS: CFImageBedSettings = {
 	enableExcalidrawUpload: true,
 	excludedImageDomains: [],
 
-	// 自动上传配置
+	// 图片自动上云
 	enableAutoUpload: false,
 	autoUploadDebounceMs: 2000,
 	autoUploadFolders: '',
+	autoUploadWholeVault: false,
 	
 	// 用户体验配置
 	showUploadProgress: true,

@@ -33,10 +33,19 @@ export default class CFImageBedPlugin extends Plugin {
 		this.eventHandlers.registerExcalidrawEvents(this);
 		this.eventHandlers.registerEditorMenuEvents(this);
 
-		// 自动上传监听器（AI 经 CLI 写文件 / Web Clip 等外部写入时自动转存图床）。
-		// 在 onLayoutReady 之后再注册，避免 Obsidian 启动时对全库触发 create 事件。
+		// 图片自动上云监听器：监听笔记改动，把图片转存到图床并改写链接。
+		// 在 onLayoutReady 之后再注册（避免启动时的全库 create 事件风暴），随后对监听范围补扫一次。
 		this.autoUploadWatcher = new AutoUploadWatcher(this, this.imageHandler, () => this.settings, this.i18n);
 		this.app.workspace.onLayoutReady(() => this.autoUploadWatcher.register());
+
+		// 手动：扫描监听范围（未配置时为整个库）内的现有笔记，确认后批量迁移图片
+		this.addCommand({
+			id: 'scan-and-migrate-images',
+			name: this.i18n.t('commands.scanAndMigrateImages'),
+			callback: () => {
+				void this.autoUploadWatcher.scanAndMigrate();
+			}
+		});
 
 		// 移动端专用命令：支持相机拍照和相册选择
 		this.addCommand({
@@ -65,7 +74,8 @@ export default class CFImageBedPlugin extends Plugin {
 	}
 
 	onunload() {
-
+		// 取消所有待处理任务；已在途的上传结果不再写回文件
+		this.autoUploadWatcher?.unload();
 	}
 
 
