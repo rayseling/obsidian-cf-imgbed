@@ -8,15 +8,6 @@ import { CFImageBedSettingTab } from './src/settings/settingsTab';
 import { I18n, resolveLanguage } from './src/utils/i18n';
 import { parseDomainList } from './src/utils/domainUtils';
 
-function apiUrlHasPath(apiUrl: string): boolean {
-	try {
-		const pathname = new URL((apiUrl || '').trim()).pathname.replace(/\/+$/, '');
-		return pathname.length > 0;
-	} catch {
-		return false;
-	}
-}
-
 export default class CFImageBedPlugin extends Plugin {
 	settings: CFImageBedSettings;
 	uploadIndex: UploadIndex;
@@ -33,8 +24,8 @@ export default class CFImageBedPlugin extends Plugin {
 
 		// 上传去重索引：存放在插件目录下，独立于 data.json，避免与设置保存互相覆盖
 		this.uploadIndex = new UploadIndex(this.app.vault.adapter, `${this.manifest.dir}/upload-index.json`);
-		// 旧版索引命名空间只含 origin；当前 API URL 没有路径时两者相同，可沿用，否则丢弃
-		await this.uploadIndex.load({ acceptLegacyV1: !apiUrlHasPath(this.settings.apiUrl) });
+		// 旧版索引记录无法归属到具体部署，load() 会作废它们（只是多传一次）
+		await this.uploadIndex.load();
 
 		// 初始化服务
 		this.uploadService = new UploadService(this.app, this.settings, this.uploadIndex);

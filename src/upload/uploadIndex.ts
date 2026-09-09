@@ -11,20 +11,15 @@ export interface UploadIndexEntry {
 }
 
 interface PersistedUploadIndex {
-	/** 1 = 命名空间只含 origin（旧版）；2 = origin + 路径。 */
-	version: 1 | 2;
+	/**
+	 * 1 = 命名空间只含 origin（旧版，来源不可辨）；2 = 曾按「当前 API 无路径」的猜测沿用过 v1 记录，
+	 * 同样不可信；3 = 命名空间为 origin + 路径，且从未混入旧记录。
+	 */
+	version: 1 | 2 | 3;
 	entries: Record<string, UploadIndexEntry>;
 }
 
-export const UPLOAD_INDEX_VERSION = 2;
-
-export interface UploadIndexLoadOptions {
-	/**
-	 * 是否接受 v1（只按 origin 命名空间）的旧记录。仅当当前 API URL 没有路径部分时两种键完全一致，
-	 * 才能安全沿用；否则旧记录可能跨目标误命中，应丢弃（代价只是多传一次）。
-	 */
-	acceptLegacyV1: boolean;
-}
+export const UPLOAD_INDEX_VERSION = 3;
 
 /** 索引持久化所需的最小适配器接口（对应 Obsidian 的 DataAdapter）。 */
 export interface UploadIndexStorage {
@@ -51,7 +46,11 @@ export class UploadIndex {
 		private filePath: string
 	) {}
 
-	async load(options: UploadIndexLoadOptions = { acceptLegacyV1: false }): Promise<void> {
+	/**
+	 * 旧版本（v1：命名空间只含 origin；v2：可能混入按当前设置猜测沿用的 v1 记录）的记录来源不可辨，
+	 * 无法判断它们对应的是哪个部署，一律作废并把文件重写为当前版本。代价只是这些图片再上传一次。
+	 */
+	async load(): Promise<void> {
 		this.entries.clear();
 		try {
 			if (!(await this.storage.exists(this.filePath))) {
@@ -59,13 +58,12 @@ export class UploadIndex {
 			}
 			const raw = await this.storage.read(this.filePath);
 			const parsed = JSON.parse(raw) as Partial<PersistedUploadIndex> | null;
-			if (!parsed || typeof parsed.entries !== 'object' || parsed.entries === null
-				|| (parsed.version !== 1 && parsed.version !== UPLOAD_INDEX_VERSION)) {
+			if (!parsed || typeof parsed.entries !== 'object' || parsed.entries === null || typeof parsed.version !== 'number') {
 				console.warn('CF ImageBed: upload index has an unknown format and was ignored');
 				return;
 			}
-			if (parsed.version === 1 && !options.acceptLegacyV1) {
-				console.warn('CF ImageBed: legacy (v1) upload index cannot be mapped onto the current API path and was discarded');
+			if (parsed.version !== UPLOAD_INDEX_VERSION) {
+				console.warn(`CF ImageBed: upload index v${parsed.version} records cannot be attributed to a deployment and were discarded`);
 				this.dirty = true;
 				void this.scheduleSave();
 				return;
@@ -74,9 +72,6 @@ export class UploadIndex {
 				if (isValidEntry(entry)) {
 					this.entries.set(key, entry);
 				}
-			}
-			if (parsed.version === 1) {
-				void this.scheduleSave(); // 升级为 v2 格式
 			}
 		} catch (error) {
 			console.warn('CF ImageBed: failed to load upload index, starting empty', error);
