@@ -87,7 +87,9 @@ function createApp() {
 			getAbstractFileByPath: (p) => entries.get(p)?.file ?? null,
 			async readBinary(file) { return entries.get(file.path).bytes.buffer.slice(0); },
 			async cachedRead(file) { return entries.get(file.path).text ?? ''; },
-			adapter: { getBasePath: () => 'C:/vault' }
+			adapter: { getBasePath: () => 'C:/vault' },
+			on: () => ({}),
+			offref() {}
 		},
 		metadataCache: {
 			resolvedLinks: {},
@@ -99,7 +101,9 @@ function createApp() {
 		workspace: {
 			getActiveFile: () => null,
 			getActiveViewOfType: () => null,
-			iterateAllLeaves(callback) { for (const leaf of app.leaves) callback(leaf); }
+			iterateAllLeaves(callback) { for (const leaf of app.leaves) callback(leaf); },
+			on: () => ({}),
+			offref() {}
 		},
 		fileManager: {
 			async trashFile(file) { app.trashed.push(file.path); entries.delete(file.path); }
