@@ -132,6 +132,8 @@ An image upload plugin for Obsidian that uploads images to CloudFlare ImgBed. It
 2. 在 Obsidian 编辑器中按 `Ctrl+V`（Windows/Linux）或 `Cmd+V`（Mac）
 3. 插件会自动上传并插入 Markdown 链接
 
+> 粘贴 / 拖拽上传失败时（图床不可达、认证错误等），图片不会丢失：插件会把它保存到 Obsidian 的附件目录并插入本地嵌入链接。若该笔记在「图片自动上云」的监听范围内，之后会自动补传；否则请稍后手动执行「上传当前文档所有图片」。
+
 #### 方式三：粘贴网络图片链接
 1. 在高级设置中开启 **启用网络图片上传**
 2. 复制 markdown 图片外链、HTML `<img>`，或直接复制图片 URL
