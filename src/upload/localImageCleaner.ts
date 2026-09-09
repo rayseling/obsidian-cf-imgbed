@@ -26,6 +26,7 @@ export type KeepReason =
 	| 'referenced'
 	| 'unsaved-edit'
 	| 'remote-unverified'
+	| 'cancelled'
 	| 'error';
 
 export interface CleanupReport {
@@ -82,6 +83,8 @@ export class LocalImageCleaner {
 	static resolveTimeoutMs = 15000;
 
 	private textCache = new Map<string, { mtime: number; text: string }>();
+	/** 插件卸载后置位：在途清理不再删除任何文件。 */
+	private disposed = false;
 
 	constructor(
 		private app: App,
@@ -94,6 +97,11 @@ export class LocalImageCleaner {
 
 	isEnabled(): boolean {
 		return Boolean(this.getSettings()?.deleteLocalAfterUpload);
+	}
+
+	/** 插件卸载时调用：作为取消信号传递给所有在途清理。 */
+	dispose(): void {
+		this.disposed = true;
 	}
 
 	expectResolve(file: TFile): ResolveWaiter {
@@ -144,7 +152,12 @@ export class LocalImageCleaner {
 			}
 			void sourceFile;
 			for (const image of images) {
-				await this.cleanupOne(image, report);
+				// 自动/命令触发的清理在每张图之前重查开关：用户中途关闭即停止
+				if (!this.isEnabled()) {
+					report.kept.push({ path: image.file.path, reason: 'disabled' });
+					continue;
+				}
+				await this.cleanupOne(image, report, { requireEnabled: true });
 			}
 			return report;
 		} finally {
@@ -176,14 +189,28 @@ export class LocalImageCleaner {
 	async cleanupOrphans(images: UploadedVaultImage[]): Promise<CleanupReport> {
 		const report: CleanupReport = { deleted: [], kept: [] };
 		for (const image of images) {
-			await this.cleanupOne(image, report);
+			// 孤立清理是用户显式确认的命令，不受「上传后删除」开关约束，但仍响应卸载信号
+			await this.cleanupOne(image, report, { requireEnabled: false });
 		}
 		this.notify(report);
 		return report;
 	}
 
-	private async cleanupOne(image: UploadedVaultImage, report: CleanupReport): Promise<void> {
+	private async cleanupOne(
+		image: UploadedVaultImage,
+		report: CleanupReport,
+		options: { requireEnabled: boolean }
+	): Promise<void> {
 		const path = image.file.path;
+		const cancelled = (): KeepReason | null => {
+			if (this.disposed) {
+				return 'cancelled';
+			}
+			if (options.requireEnabled && !this.isEnabled()) {
+				return 'disabled';
+			}
+			return null;
+		};
 		try {
 			const precheck = await this.check(image);
 			if (precheck.reason) {
@@ -192,6 +219,11 @@ export class LocalImageCleaner {
 			}
 			if (!(await this.verifyRemote(image.url))) {
 				report.kept.push({ path, reason: 'remote-unverified' });
+				return;
+			}
+			const cancelledAfterNetwork = cancelled();
+			if (cancelledAfterNetwork) {
+				report.kept.push({ path, reason: cancelledAfterNetwork });
 				return;
 			}
 			// 远端验证期间本地图片或引用可能已变化：进回收站前再完整复核一次。
@@ -215,6 +247,12 @@ export class LocalImageCleaner {
 				}
 				if (!sameStamp(stampOf(current), recheck.stamp) || guard.changed) {
 					report.kept.push({ path, reason: 'changed' });
+					return;
+				}
+				// 真正删除前最后一次取消检查：开关已关 / 插件已卸载 → 不删
+				const cancelledBeforeTrash = cancelled();
+				if (cancelledBeforeTrash) {
+					report.kept.push({ path, reason: cancelledBeforeTrash });
 					return;
 				}
 				await this.app.fileManager.trashFile(current);
@@ -344,6 +382,15 @@ export class LocalImageCleaner {
 					referenced = true; // 正在查看这张图片
 					return;
 				}
+				// Excalidraw：部分版本的 getViewData() 返回的是上次保存的快照，未落盘的新引用不在其中，
+				// 无法确认实时内容，打开的 Excalidraw 视图一律按「有引用」处理（保守不删）。
+				const viewType = typeof (view as { getViewType?: () => string }).getViewType === 'function'
+					? (view as { getViewType: () => string }).getViewType()
+					: '';
+				if (viewType === 'excalidraw' || (viewFile && viewFile.name.toLowerCase().endsWith('.excalidraw.md'))) {
+					referenced = true;
+					return;
+				}
 				if (typeof view.getViewData === 'function') {
 					const ext = viewFile?.extension ?? 'md';
 					referenced = textReferencesImage(view.getViewData(), ext, file);
@@ -405,8 +452,13 @@ export class LocalImageCleaner {
 			if (get.status !== 200) {
 				return false;
 			}
-			if (contentTypeOf(get.headers).startsWith('image/')) {
+			const contentType = contentTypeOf(get.headers);
+			if (contentType.startsWith('image/')) {
 				return true;
+			}
+			// 明确的非图片类型（HTML 登录页、JSON/XML 错误响应）直接拒绝，不再看响应体
+			if (/^(text\/html|application\/xhtml\+xml|application\/json|text\/plain)\b/.test(contentType)) {
+				return false;
 			}
 			return looksLikeImageBytes(get.arrayBuffer);
 		} catch (error) {
@@ -478,9 +530,39 @@ export function looksLikeImageBytes(buffer: ArrayBuffer | undefined): boolean {
 		const brand = ascii(8, 4).toLowerCase();
 		return ['avif', 'avis', 'heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand);
 	}
-	// SVG：前 1KB 内必须出现 <svg 标签；单纯的 XML 文档（如 S3 的 <Error> 响应）不算图片
-	const head = new TextDecoder().decode(new Uint8Array(buffer.slice(0, 1024))).toLowerCase();
-	return /<svg[\s>]/.test(head);
+	// SVG 必须是 SVG 文档：跳过 BOM / 空白 / XML 声明 / 注释 / DOCTYPE 后，第一个元素必须是 <svg。
+	// 任意位置出现 <svg 不算（带内联 SVG 图标的 HTML 登录页不是图片）；<html>/<body> 一律拒绝。
+	const head = new TextDecoder().decode(new Uint8Array(buffer.slice(0, 2048)));
+	return isSvgDocument(head);
+}
+
+/** 判断文本是否以 SVG 根元素开头（允许前置 BOM、空白、XML 声明、注释、DOCTYPE）。 */
+export function isSvgDocument(text: string): boolean {
+	let rest = text.replace(/^\ufeff/, '');
+	for (;;) {
+		rest = rest.replace(/^\s+/, '');
+		if (/^<\?xml\b/i.test(rest)) {
+			const end = rest.indexOf('?>');
+			if (end === -1) return false;
+			rest = rest.slice(end + 2);
+			continue;
+		}
+		if (rest.startsWith('<!--')) {
+			const end = rest.indexOf('-->');
+			if (end === -1) return false;
+			rest = rest.slice(end + 3);
+			continue;
+		}
+		if (/^<!doctype\b/i.test(rest)) {
+			if (!/^<!doctype\s+svg\b/i.test(rest)) return false; // <!DOCTYPE html> 等一律拒绝
+			const end = rest.indexOf('>');
+			if (end === -1) return false;
+			rest = rest.slice(end + 1);
+			continue;
+		}
+		break;
+	}
+	return /^<svg[\s>]/i.test(rest);
 }
 
 /** 文本（Markdown / Canvas / 视图数据）是否引用了该库内图片。 */

@@ -458,3 +458,63 @@ test('a same-size, same-mtime replacement after the final hash is caught by the 
 	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'changed' }]);
 	assert.ok(ctx.app.vault.getAbstractFileByPath('attachments/pic.png'));
 });
+
+test('an HTML login page with an inline SVG icon is not accepted as the remote image', async () => {
+	const page = Array.from(new TextEncoder().encode('<html><body>\n  <svg viewBox="0 0 10 10"></svg>\n  <form>Login required</form>\n</body></html>'));
+	// HEAD 与 GET 都是 200 text/html
+	const typed = await setup({ fetcher: createFetcher({ contentType: 'text/html', perMethod: { GET: { body: page } } }) });
+	let report = await runAfterWriteBack(typed);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'remote-unverified' }]);
+
+	// 没有 Content-Type，只能靠响应体判断
+	const untyped = await setup({ fetcher: createFetcher({ contentType: '', perMethod: { GET: { body: page } } }) });
+	report = await runAfterWriteBack(untyped);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'remote-unverified' }]);
+
+	// 真正的 SVG 文档（带 BOM、注释、DOCTYPE svg）仍然通过
+	const svg = Array.from(new TextEncoder().encode('\ufeff<?xml version="1.0"?>\n<!-- icon -->\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x">\n<svg xmlns="http://www.w3.org/2000/svg"></svg>'));
+	const ok = await setup({ fetcher: createFetcher({ contentType: '', perMethod: { GET: { body: svg } } }) });
+	report = await runAfterWriteBack(ok);
+	assert.deepEqual(report.deleted, ['attachments/pic.png']);
+
+	// <!DOCTYPE html> 开头、正文含 <svg> 也拒绝
+	const doctype = Array.from(new TextEncoder().encode('<!DOCTYPE html><svg></svg>'));
+	const rejected = await setup({ fetcher: createFetcher({ contentType: '', perMethod: { GET: { body: doctype } } }) });
+	report = await runAfterWriteBack(rejected);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'remote-unverified' }]);
+});
+
+test('an open Excalidraw view blocks deletion even when its view data does not mention the image', async () => {
+	const byName = await setup();
+	byName.app.leaves = [{ view: { file: new TFile('drawings/sketch.excalidraw.md'), getViewData: () => 'nothing here' } }];
+	let report = await runAfterWriteBack(byName);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'unsaved-edit' }]);
+
+	const byType = await setup();
+	byType.app.leaves = [{ view: { file: new TFile('drawings/other.md'), getViewType: () => 'excalidraw', getViewData: () => '' } }];
+	report = await runAfterWriteBack(byType);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'unsaved-edit' }]);
+});
+
+test('turning the setting off or unloading the plugin while a cleanup is in flight aborts before trashFile', async () => {
+	let ctxRef = null;
+	const offDuringNetwork = createFetcher({ onCall: () => { ctxRef.settings.deleteLocalAfterUpload = false; } });
+	const off = await setup({ fetcher: offDuringNetwork });
+	ctxRef = off;
+	let report = await runAfterWriteBack(off);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'disabled' }]);
+	assert.deepEqual(off.app.trashed, []);
+
+	const unloadDuringNetwork = createFetcher({ onCall: () => { ctxRef.cleaner.dispose(); } });
+	const unloaded = await setup({ fetcher: unloadDuringNetwork });
+	ctxRef = unloaded;
+	report = await runAfterWriteBack(unloaded);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'cancelled' }]);
+	assert.deepEqual(unloaded.app.trashed, []);
+
+	// 孤立清理不受开关约束，但仍响应卸载
+	const orphan = await setup();
+	orphan.settings.deleteLocalAfterUpload = false;
+	report = await orphan.cleaner.cleanupOrphans(orphan.uploaded);
+	assert.deepEqual(report.deleted, ['attachments/pic.png']);
+});

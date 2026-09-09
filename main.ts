@@ -100,8 +100,9 @@ export default class CFImageBedPlugin extends Plugin {
 	}
 
 	onunload() {
-		// 取消所有待处理任务；已在途的上传结果不再写回文件
+		// 取消所有待处理任务；已在途的上传结果不再写回文件，在途的清理不再删除文件
 		this.autoUploadWatcher?.unload();
+		this.localImageCleaner?.dispose();
 	}
 
 	private async cleanupOrphanImages(): Promise<void> {
