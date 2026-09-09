@@ -232,3 +232,68 @@ test('a corrupt or foreign index file is ignored instead of crashing', async () 
 	await foreign.load();
 	assert.equal(foreign.size, 0);
 });
+
+test('when the shared first request fails, the waiters coalesce onto one retry instead of each re-uploading', async () => {
+	globalThis.__notices = [];
+	let calls = 0;
+	globalThis.__requestUrl = async () => {
+		calls++;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		if (calls === 1) {
+			return { status: 500, json: null };
+		}
+		return { status: 200, json: [{ src: '/file/retry.png' }] };
+	};
+	const { service } = await createService(createSettings());
+
+	const results = await Promise.all([1, 2, 3].map(() => service.uploadImageDetailed(png([4, 2]), { showErrorNotice: false })));
+
+	assert.equal(calls, 2, 'one failed request + exactly one shared retry');
+	// 发起失败请求的调用如实返回 null；两个等待者合并到同一次重试并复用其结果
+	assert.equal(results.filter((result) => result === null).length, 1);
+	assert.deepEqual(
+		results.filter(Boolean).map((result) => result.url),
+		['http://img.example:7658/file/retry.png', 'http://img.example:7658/file/retry.png']
+	);
+});
+
+test('a cached relative src is always prefixed, even after switching returnFormat to full', async () => {
+	installServer();
+	const storage = createStorage();
+	const first = await createService(createSettings({ returnFormat: 'default' }), storage);
+	await first.service.uploadImage(png([6]));
+	await first.index.flush();
+
+	const second = await createService(createSettings({ returnFormat: 'full' }), storage);
+	const reused = await second.service.uploadImageDetailed(png([6]));
+	assert.equal(reused.reused, true);
+	assert.equal(reused.url, 'http://img.example:7658/file/upload-1.png');
+	assert.equal(second.service.buildReturnUrl('https://cdn.example/abs.png'), 'https://cdn.example/abs.png');
+	assert.equal(second.service.buildReturnUrl('file/no-slash.png'), 'http://img.example:7658/file/no-slash.png');
+});
+
+test('namespace includes the API path, so two deployments on one host do not share uploads', () => {
+	assert.notEqual(
+		buildUploadNamespace(createSettings({ apiUrl: 'https://host.example/imgbed-a' })),
+		buildUploadNamespace(createSettings({ apiUrl: 'https://host.example/imgbed-b' }))
+	);
+	assert.equal(
+		buildUploadNamespace(createSettings({ apiUrl: 'https://host.example/imgbed-a/' })),
+		buildUploadNamespace(createSettings({ apiUrl: 'https://HOST.example/imgbed-a' }))
+	);
+});
+
+test('changing the target image bed while an upload is in flight does not record the result under the old key', async () => {
+	const settings = createSettings();
+	let calls = 0;
+	globalThis.__requestUrl = async () => {
+		calls++;
+		settings.apiUrl = 'http://other.example'; // 上传途中切换图床
+		return { status: 200, json: [{ src: '/file/moved.png' }] };
+	};
+	const { service, index } = await createService(settings);
+	const outcome = await service.uploadImageDetailed(png([8, 8]));
+	assert.equal(outcome.src, '/file/moved.png');
+	assert.equal(index.size, 0, 'result must not be indexed under the old namespace');
+	assert.equal(calls, 1);
+});

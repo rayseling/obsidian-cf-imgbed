@@ -166,13 +166,15 @@ export function buildUploadIndexKey(contentHash: string, namespace: string, poli
  */
 export function buildUploadNamespace(settings: Pick<CFImageBedSettings, 'apiUrl' | 'uploadChannel' | 'channelName'>): string {
 	const apiUrl = (settings.apiUrl || '').trim();
-	let origin = apiUrl.toLowerCase().replace(/\/+$/, '');
+	let target = apiUrl.toLowerCase().replace(/\/+$/, '');
 	try {
-		origin = new URL(apiUrl).origin.toLowerCase();
+		// origin + 路径：同一域名下的不同部署（/imgbed-a、/imgbed-b）是不同图床，不能互相复用
+		const parsed = new URL(apiUrl);
+		target = `${parsed.origin}${parsed.pathname}`.toLowerCase().replace(/\/+$/, '');
 	} catch {
 		// 非标准 URL 时退回到去掉尾部斜杠的原文
 	}
-	return `${origin}|${settings.uploadChannel}|${(settings.channelName || '').trim()}`;
+	return `${target}|${settings.uploadChannel}|${(settings.channelName || '').trim()}`;
 }
 
 /**
