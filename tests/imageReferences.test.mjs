@@ -96,3 +96,25 @@ test('a wiki embed followed by a markdown image on the same line yields two sepa
 		['markdown', 'b.png', '![b](b.png)']
 	]);
 });
+
+test('a closing fence may not carry an info string', () => {
+	const content = ['```md', '![a](a.png)', '```not-a-closing-fence', '![b](b.png)', '```', '![c](c.png)'].join('\n');
+	assert.deepEqual(paths(extractMarkdownAndWikiImageReferences(content)), ['c.png']);
+});
+
+test('indented code blocks (4 spaces / tab after a blank line) are excluded, list continuations are not', () => {
+	const content = [
+		'![top](top.png)',
+		'',
+		'    ![indented](indented.png)',
+		'',
+		'    ![still-indented](still.png)',
+		'![after](after.png)',
+		'- item',
+		'    ![list-child](child.png)',
+		'',
+		'\t![tab](tab.png)',
+		'![end](end.png)'
+	].join('\n');
+	assert.deepEqual(paths(extractMarkdownAndWikiImageReferences(content)), ['top.png', 'after.png', 'child.png', 'end.png']);
+});
