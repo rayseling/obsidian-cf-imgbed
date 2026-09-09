@@ -80,8 +80,11 @@ export class UploadService {
 		options: UploadImageOptions = {}
 	): Promise<UploadOutcome | null> {
 		this.syncLanguage();
+		// 一次上传固定一份设置快照：请求目标、认证、返回链接前缀、去重键全部来自同一份，
+		// 上传途中改设置不会把 A 图床的路径拼上 B 图床的域名，也不会写进错误的索引命名空间。
+		const settings: CFImageBedSettings = { ...this.settings };
 
-		if (!this.settings.apiUrl || (!this.settings.authCode && !this.settings.apiToken)) {
+		if (!settings.apiUrl || (!settings.authCode && !settings.apiToken)) {
 			if (options.showErrorNotice !== false) {
 				new Notice(this.i18n.t('notices.uploadConfigRequired'));
 			}
@@ -89,10 +92,10 @@ export class UploadService {
 		}
 
 		try {
-			const runtimeConfig = this.resolveUploadRuntimeConfig(file, options.noteFile ?? this.app.workspace.getActiveFile());
+			const runtimeConfig = this.resolveUploadRuntimeConfig(file, options.noteFile ?? this.app.workspace.getActiveFile(), settings);
 
 			// 检查文件类型
-			if (!this.isAllowedFileType(runtimeConfig.file)) {
+			if (!this.isAllowedFileType(runtimeConfig.file, settings)) {
 				if (options.showErrorNotice !== false) {
 					new Notice(this.i18n.t('notices.unsupportedFileType', { type: runtimeConfig.file.type }));
 				}
@@ -100,7 +103,7 @@ export class UploadService {
 			}
 
 			// 检查文件大小
-			if (!this.isFileSizeAllowed(runtimeConfig.file)) {
+			if (!this.isFileSizeAllowed(runtimeConfig.file, settings)) {
 				if (options.showErrorNotice !== false) {
 					new Notice(this.i18n.t('notices.fileSizeExceeded', {
 						size: ClientCompressor.formatFileSize(runtimeConfig.file.size)
@@ -110,15 +113,15 @@ export class UploadService {
 			}
 
 			// 内容去重：命中索引直接复用旧链接，不再发请求
-			const dedupeKey = options.bypassDedupe ? null : await this.resolveDedupeKey(runtimeConfig.file);
+			const dedupeKey = options.bypassDedupe ? null : await this.resolveDedupeKey(runtimeConfig.file, settings);
 			// 循环：命中索引直接复用；有同图请求在途就等它；它失败后重新回到循环顶部，
 			// 这样多个等待者会再次合并到「第一个重试者」的请求上，而不是各自重传。
 			while (dedupeKey) {
 				const cached = this.uploadIndex?.get(dedupeKey);
 				if (cached) {
 					this.debugLog(`CF ImageBed: reusing already uploaded image ${cached.src}`);
-					this.notifyReused();
-					return { url: this.buildReturnUrl(cached.src), src: cached.src, reused: true };
+					this.notifyReused(settings);
+					return { url: this.buildReturnUrl(cached.src, settings), src: cached.src, reused: true };
 				}
 				const inFlight = this.inFlight.get(dedupeKey);
 				if (!inFlight) {
@@ -126,12 +129,12 @@ export class UploadService {
 				}
 				const shared = await inFlight;
 				if (shared) {
-					this.notifyReused();
+					this.notifyReused(settings);
 					return { ...shared, reused: true };
 				}
 			}
 
-			const task = this.performUpload(runtimeConfig, dedupeKey);
+			const task = this.performUpload(runtimeConfig, dedupeKey, settings);
 			if (dedupeKey) {
 				this.inFlight.set(dedupeKey, task.catch(() => null));
 			}
@@ -144,40 +147,40 @@ export class UploadService {
 			}
 		} catch (error) {
 			console.error('CF ImageBed: Image upload failed:', error);
-			if (options.showErrorNotice !== false && this.settings.showErrorNotification) {
+			if (options.showErrorNotice !== false && settings.showErrorNotification) {
 				const errorMessage = error instanceof Error ? error.message : String(error);
 				new Notice(
 					this.i18n.t('notices.uploadFailed', { message: errorMessage }),
-					(this.settings.notificationDuration ?? 5) * 1000
+					(settings.notificationDuration ?? 5) * 1000
 				);
 			}
 			return null;
 		}
 	}
 
-	private async performUpload(runtimeConfig: UploadRuntimeConfig, dedupeKey: string | null): Promise<UploadOutcome> {
+	private async performUpload(runtimeConfig: UploadRuntimeConfig, dedupeKey: string | null, settings: CFImageBedSettings): Promise<UploadOutcome> {
 		// 客户端处理（水印 + 压缩）
 		let processedFile = runtimeConfig.file;
 
 		// 1. 添加水印
-		if (this.settings.enableWatermark && ClientWatermark.isWatermarkable(runtimeConfig.file)) {
+		if (settings.enableWatermark && ClientWatermark.isWatermarkable(runtimeConfig.file)) {
 			this.debugLog('CF ImageBed: Starting watermark addition');
 			processedFile = await ClientWatermark.addWatermark(
 				processedFile,
-				this.settings.watermarkText,
-				this.settings.watermarkPosition,
-				this.settings.watermarkSize,
-				this.settings.watermarkOpacity
+				settings.watermarkText,
+				settings.watermarkPosition,
+				settings.watermarkSize,
+				settings.watermarkOpacity
 			);
 		}
 
 		// 2. 客户端压缩
-		if (this.settings.enableClientCompress && ClientCompressor.isCompressible(processedFile)) {
+		if (settings.enableClientCompress && ClientCompressor.isCompressible(processedFile)) {
 			this.debugLog('CF ImageBed: Starting client compression');
 			processedFile = await ClientCompressor.compressImage(
 				processedFile,
-				this.settings.targetSize,
-				this.settings.compressThreshold
+				settings.targetSize,
+				settings.compressThreshold
 			);
 
 			// 显示压缩结果
@@ -186,19 +189,17 @@ export class UploadService {
 			this.debugLog(`CF ImageBed: Processing complete - Original: ${originalSize}, Processed: ${processedSize}`);
 		}
 
-		const result = this.shouldUseChunkedUpload(processedFile)
-			? await this.chunkedUpload(processedFile, runtimeConfig)
-			: await this.simpleUpload(processedFile, runtimeConfig);
+		const result = this.shouldUseChunkedUpload(processedFile, settings)
+			? await this.chunkedUpload(processedFile, runtimeConfig, settings)
+			: await this.simpleUpload(processedFile, runtimeConfig, settings);
 
 		const src = this.extractSrc(result);
 		if (!src) {
 			throw new Error(this.i18n.t('errors.serverResponseInvalid'));
 		}
 
-		// 只记录成功结果；写盘由索引串行化。
-		// 上传期间若用户改了图床/渠道/处理设置，键已不再对应本次实际发往的目标，则不记录，避免把
-		// 新图床的结果写进旧图床的命名空间。
-		if (dedupeKey && this.uploadIndex && dedupeKey === this.rebuildKey(dedupeKey)) {
+		// 只记录成功结果；写盘由索引串行化。键与请求目标来自同一份设置快照，不会错位。
+		if (dedupeKey && this.uploadIndex) {
 			void this.uploadIndex.set(dedupeKey, {
 				src,
 				name: runtimeConfig.file.name,
@@ -208,7 +209,7 @@ export class UploadService {
 		}
 
 		// 可选：本地备份
-		if (this.settings.enableLocalBackup && runtimeConfig.backupPath.trim()) {
+		if (settings.enableLocalBackup && runtimeConfig.backupPath.trim()) {
 			try {
 				await this.saveLocalBackup(processedFile, runtimeConfig.backupPath);
 			} catch (e) {
@@ -216,84 +217,79 @@ export class UploadService {
 			}
 		}
 
-		return { url: this.buildReturnUrl(src), src, reused: false };
+		return { url: this.buildReturnUrl(src, settings), src, reused: false };
 	}
 
 	/** 根据返回格式设置把服务端 src 拼成最终链接（优先自定义前缀，否则回退到 API URL）。 */
-	buildReturnUrl(src: string): string {
+	buildReturnUrl(src: string, settings: CFImageBedSettings = this.settings): string {
 		// 绝对链接（returnFormat=full 时服务端直接返回完整 URL）原样返回；
 		// 相对 src 无论当前返回格式如何都要拼前缀——索引里可能存着旧格式下的相对 src。
 		if (/^https?:\/\//i.test(src)) {
 			return src;
 		}
-		const baseUrl = (this.settings.customReturnBaseUrl?.trim() || this.settings.apiUrl).replace(/\/+$/, '');
+		const baseUrl = (settings.customReturnBaseUrl?.trim() || settings.apiUrl).replace(/\/+$/, '');
 		return `${baseUrl}${src.startsWith('/') ? '' : '/'}${src}`;
 	}
 
 	/** 去重键：原始字节 SHA-256 + 目标命名空间 + 处理策略；去重关闭或哈希失败时返回 null。 */
-	private async resolveDedupeKey(file: File): Promise<string | null> {
-		if (!this.uploadIndex || this.settings.enableUploadDedupe === false) {
+	private async resolveDedupeKey(file: File, settings: CFImageBedSettings): Promise<string | null> {
+		if (!this.uploadIndex || settings.enableUploadDedupe === false) {
 			return null;
 		}
 		try {
 			const hash = await sha256Hex(file);
-			return buildUploadIndexKey(hash, buildUploadNamespace(this.settings), buildProcessingPolicy(this.settings));
+			return buildUploadIndexKey(hash, buildUploadNamespace(settings), buildProcessingPolicy(settings));
 		} catch (error) {
 			console.warn('CF ImageBed: failed to hash image, uploading without dedupe', error);
 			return null;
 		}
 	}
 
-	/** 用当前设置重算同一哈希的键，用于检测上传期间设置是否变化。 */
-	private rebuildKey(previousKey: string): string {
-		const hash = previousKey.split('|')[0];
-		return buildUploadIndexKey(hash, buildUploadNamespace(this.settings), buildProcessingPolicy(this.settings));
-	}
-
-	private notifyReused(): void {
-		if (this.settings.showUploadProgress) {
+	private notifyReused(settings: CFImageBedSettings): void {
+		if (settings.showUploadProgress) {
 			new Notice(this.i18n.t('notices.uploadReused'));
 		}
 	}
 
-	private shouldUseChunkedUpload(file: File): boolean {
-		if (!['telegram', 'discord'].includes(this.settings.uploadChannel)) {
+	private shouldUseChunkedUpload(file: File, settings: CFImageBedSettings): boolean {
+		if (!['telegram', 'discord'].includes(settings.uploadChannel)) {
 			return false;
 		}
 
-		if (this.settings.chunkSizeMB <= 0) {
+		if (settings.chunkSizeMB <= 0) {
 			return false;
 		}
 
-		const chunkSizeBytes = this.settings.chunkSizeMB * 1024 * 1024;
+		const chunkSizeBytes = settings.chunkSizeMB * 1024 * 1024;
 		return file.size > chunkSizeBytes;
 	}
 
 	private getUploadQueryParams(
 		runtimeConfig: UploadRuntimeConfig,
+		settings: CFImageBedSettings,
 		extraParams?: Record<string, string>
 	): URLSearchParams {
 		const params = new URLSearchParams({
-			uploadChannel: this.settings.uploadChannel,
+			uploadChannel: settings.uploadChannel,
 			uploadNameType: runtimeConfig.uploadNameType,
-			returnFormat: this.settings.returnFormat,
-			autoRetry: this.settings.autoRetry.toString()
+			returnFormat: settings.returnFormat,
+			autoRetry: settings.autoRetry.toString()
 		});
 
-		if (!this.settings.apiToken && this.settings.authCode) {
-			params.append('authCode', this.settings.authCode);
+		if (!settings.apiToken && settings.authCode) {
+			params.append('authCode', settings.authCode);
 		}
 
-		if (this.settings.channelName?.trim()) {
-			params.append('channelName', this.settings.channelName.trim());
+		if (settings.channelName?.trim()) {
+			params.append('channelName', settings.channelName.trim());
 		}
 
 		if (runtimeConfig.uploadFolder.trim()) {
 			params.append('uploadFolder', runtimeConfig.uploadFolder.trim());
 		}
 
-		if (this.settings.uploadChannel === 'telegram') {
-			params.append('serverCompress', this.settings.serverCompress.toString());
+		if (settings.uploadChannel === 'telegram') {
+			params.append('serverCompress', settings.serverCompress.toString());
 		}
 
 		if (extraParams) {
@@ -305,39 +301,40 @@ export class UploadService {
 		return params;
 	}
 
-	private getHeaders(boundary: string): Record<string, string> {
+	private getHeaders(boundary: string, settings: CFImageBedSettings): Record<string, string> {
 		const headers: Record<string, string> = {
 			'Content-Type': `multipart/form-data; boundary=${boundary}`
 		};
 
-		if (this.settings.apiToken?.trim()) {
-			headers.Authorization = `Bearer ${this.settings.apiToken.trim()}`;
+		if (settings.apiToken?.trim()) {
+			headers.Authorization = `Bearer ${settings.apiToken.trim()}`;
 		}
 
 		return headers;
 	}
 
-	private async simpleUpload(file: File, runtimeConfig: UploadRuntimeConfig): Promise<unknown> {
-		const params = this.getUploadQueryParams(runtimeConfig);
-		return this.sendMultipartRequest(params, { file });
+	private async simpleUpload(file: File, runtimeConfig: UploadRuntimeConfig, settings: CFImageBedSettings): Promise<unknown> {
+		const params = this.getUploadQueryParams(runtimeConfig, settings);
+		return this.sendMultipartRequest(params, { file }, settings);
 	}
 
-	private async chunkedUpload(file: File, runtimeConfig: UploadRuntimeConfig): Promise<unknown> {
-		if (this.settings.chunkSizeMB <= 0) {
+	private async chunkedUpload(file: File, runtimeConfig: UploadRuntimeConfig, settings: CFImageBedSettings): Promise<unknown> {
+		if (settings.chunkSizeMB <= 0) {
 			throw new Error(this.i18n.t('errors.chunkSizeMustBePositive'));
 		}
 
-		const chunkSizeBytes = this.settings.chunkSizeMB * 1024 * 1024;
+		const chunkSizeBytes = settings.chunkSizeMB * 1024 * 1024;
 		const totalChunks = Math.ceil(file.size / chunkSizeBytes);
 		const originalFileType = file.type || 'application/octet-stream';
 
 		const initResult = await this.sendMultipartRequest(
-			this.getUploadQueryParams(runtimeConfig, { initChunked: 'true' }),
+			this.getUploadQueryParams(runtimeConfig, settings, { initChunked: 'true' }),
 			{
 				totalChunks: String(totalChunks),
 				originalFileName: file.name,
 				originalFileType
-			}
+			},
+			settings
 		);
 
 		const uploadId = this.extractUploadId(initResult);
@@ -352,7 +349,7 @@ export class UploadService {
 			const chunkFile = new File([chunkBlob], file.name, { type: originalFileType });
 
 			await this.sendMultipartRequest(
-				this.getUploadQueryParams(runtimeConfig, { chunked: 'true' }),
+				this.getUploadQueryParams(runtimeConfig, settings, { chunked: 'true' }),
 				{
 					uploadId,
 					chunkIndex: String(chunkIndex),
@@ -360,32 +357,35 @@ export class UploadService {
 					originalFileName: file.name,
 					originalFileType,
 					file: chunkFile
-				}
+				},
+				settings
 			);
 		}
 
 		return this.sendMultipartRequest(
-			this.getUploadQueryParams(runtimeConfig, { chunked: 'true', merge: 'true' }),
+			this.getUploadQueryParams(runtimeConfig, settings, { chunked: 'true', merge: 'true' }),
 			{
 				uploadId,
 				totalChunks: String(totalChunks),
 				originalFileName: file.name,
 				originalFileType
-			}
+			},
+			settings
 		);
 	}
 
 	private async sendMultipartRequest(
 		params: URLSearchParams,
-		fields: Record<string, string | File>
+		fields: Record<string, string | File>,
+		settings: CFImageBedSettings
 	): Promise<unknown> {
 		const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
 		const body = await this.buildMultipartBody(boundary, fields);
 		const response = await requestUrl({
-			url: `${this.settings.apiUrl}/upload?${params.toString()}`,
+			url: `${settings.apiUrl}/upload?${params.toString()}`,
 			method: 'POST',
 			body: body.buffer,
-			headers: this.getHeaders(boundary)
+			headers: this.getHeaders(boundary, settings)
 		});
 
 		if (response.status !== 200) {
@@ -463,23 +463,23 @@ export class UploadService {
 		return null;
 	}
 
-	private resolveUploadRuntimeConfig(file: File, noteFile: TFile | null): UploadRuntimeConfig {
+	private resolveUploadRuntimeConfig(file: File, noteFile: TFile | null, settings: CFImageBedSettings): UploadRuntimeConfig {
 		const templateContext = {
 			noteFile,
 			originalFile: file
 		};
-		const uploadNameType = this.settings.uploadNameType === 'custom'
+		const uploadNameType = settings.uploadNameType === 'custom'
 			? 'origin'
-			: this.settings.uploadNameType;
-		const renamedFile = this.settings.uploadNameType === 'custom'
-			? buildCustomUploadFile(file, this.settings.customUploadNamePattern, templateContext)
+			: settings.uploadNameType;
+		const renamedFile = settings.uploadNameType === 'custom'
+			? buildCustomUploadFile(file, settings.customUploadNamePattern, templateContext)
 			: file;
 
 		return {
 			file: renamedFile,
 			uploadNameType,
-			uploadFolder: resolveTemplatePath(this.settings.uploadFolder, templateContext),
-			backupPath: resolveTemplatePath(this.settings.backupPath, templateContext)
+			uploadFolder: resolveTemplatePath(settings.uploadFolder, templateContext),
+			backupPath: resolveTemplatePath(settings.backupPath, templateContext)
 		};
 	}
 
@@ -539,16 +539,16 @@ export class UploadService {
 	/**
 	 * 检查文件类型是否允许
 	 */
-	private isAllowedFileType(file: File): boolean {
+	private isAllowedFileType(file: File, settings: CFImageBedSettings): boolean {
 		const extension = file.name.split('.').pop()?.toLowerCase();
-		return extension ? this.settings.allowedFileTypes.includes(extension) : false;
+		return extension ? settings.allowedFileTypes.includes(extension) : false;
 	}
 
 	/**
 	 * 检查文件大小是否允许
 	 */
-	private isFileSizeAllowed(file: File): boolean {
-		const maxSizeBytes = this.settings.maxFileSize * 1024 * 1024;
+	private isFileSizeAllowed(file: File, settings: CFImageBedSettings): boolean {
+		const maxSizeBytes = settings.maxFileSize * 1024 * 1024;
 		return file.size <= maxSizeBytes;
 	}
 }
