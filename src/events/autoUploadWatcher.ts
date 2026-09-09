@@ -20,6 +20,8 @@ interface FileState {
 	manual: boolean;
 	/** 连续上传失败次数，用于有限退避重试；成功后清零。 */
 	attempts: number;
+	/** 因「图片其实已可解析」而立即重跑的次数；有上限，防止解析结果与上传方不一致时无限重跑。 */
+	unresolvedReruns: number;
 }
 
 interface QueueItem {
@@ -265,7 +267,7 @@ export class AutoUploadWatcher {
 	private getState(path: string): FileState {
 		let state = this.states.get(path);
 		if (!state) {
-			state = { timer: null, processing: false, rerun: false, manual: false, attempts: 0 };
+			state = { timer: null, processing: false, rerun: false, manual: false, attempts: 0, unresolvedReruns: 0 };
 			this.states.set(path, state);
 		}
 		return state;
@@ -305,12 +307,43 @@ export class AutoUploadWatcher {
 		return scope !== null && isPathInScope(path, scope);
 	}
 
-	private findVaultFileByBasename(referencePath: string): boolean {
-		const key = imageBasename(referencePath);
-		if (!key) {
+	/**
+	 * 用与上传方（ImageHandler.resolveLocalFile）相同的方式判断引用现在能否解析：
+	 * 链接路径解析、库内精确路径、相对于笔记的相对路径。只按文件名搜索会在
+	 * 「其他目录有同名图片但引用本身解析不到」时无限重跑。
+	 */
+	private canResolveNow(referencePath: string, notePath: string): boolean {
+		let decoded = referencePath.trim();
+		try {
+			decoded = decodeURIComponent(decoded);
+		} catch {
+			// 保留原文
+		}
+		const normalized = decoded.replace(/^<|>$/g, '').replace(/\\/g, '/').replace(/^\/+/, '');
+		if (!normalized) {
 			return false;
 		}
-		return this.plugin.app.vault.getFiles().some((file) => file.name.toLowerCase() === key);
+		const { metadataCache, vault } = this.plugin.app;
+		const byLink = metadataCache.getFirstLinkpathDest(normalized, notePath);
+		if (byLink instanceof TFile) {
+			return true;
+		}
+		if (vault.getAbstractFileByPath(normalized) instanceof TFile) {
+			return true;
+		}
+		if (normalized.startsWith('./') || normalized.startsWith('../')) {
+			const noteDir = notePath.includes('/') ? notePath.slice(0, notePath.lastIndexOf('/')) : '';
+			const parts = noteDir ? noteDir.split('/') : [];
+			for (const part of normalized.split('/')) {
+				if (part === '..') {
+					parts.pop();
+				} else if (part !== '.') {
+					parts.push(part);
+				}
+			}
+			return vault.getAbstractFileByPath(parts.join('/')) instanceof TFile;
+		}
+		return false;
 	}
 
 	private enqueue(path: string, manual: boolean): void {
@@ -361,8 +394,11 @@ export class AutoUploadWatcher {
 			if (this.disposed) {
 				return;
 			}
-			if (!state.manual && !this.isStillWatched(item.path)) {
-				return; // 处理期间开关被关掉：不写回
+			if (file.path !== item.path) {
+				return; // 处理期间笔记被改名/移动：本任务作废，改名事件已按新路径重新判断
+			}
+			if (!state.manual && !this.isStillWatched(file.path)) {
+				return; // 处理期间开关被关掉或范围被缩小：不写回
 			}
 			// 网络/上传失败（不含「库内找不到图片」）→ 有限退避重试
 			const uploadFailures = result.failed - result.unresolvedLocal.length;
@@ -398,8 +434,9 @@ export class AutoUploadWatcher {
 				}
 			}
 			for (const unresolved of result.unresolvedLocal) {
-				// 图片可能在我们登记等待之前就已落盘（create 事件已错过）：此时直接重跑，否则登记等待
-				if (this.findVaultFileByBasename(unresolved)) {
+				// 图片可能在我们登记等待之前就已落盘（create 事件已错过）：能解析就立即重跑（有上限），否则登记等待
+				if (state.unresolvedReruns < 2 && this.canResolveNow(unresolved, file.path)) {
+					state.unresolvedReruns++;
 					state.rerun = true;
 				} else {
 					this.waitForImage(unresolved, file.path);

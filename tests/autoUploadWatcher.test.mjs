@@ -154,7 +154,20 @@ async function setup(settingsOverrides = {}, handlerOptions = {}) {
 	const imageHandler = createImageHandler(handlerOptions);
 	const domEvents = {};
 	const plugin = {
-		app: { vault },
+		app: {
+			vault,
+			metadataCache: {
+				// 与 Obsidian 一致：按链接路径解析；同名文件位于其他目录时只在链接是纯文件名时命中
+				getFirstLinkpathDest(linkPath, sourcePath) {
+					if (linkPath.includes('/')) {
+						return vault.getAbstractFileByPath(linkPath);
+					}
+					const dir = sourcePath.includes('/') ? sourcePath.slice(0, sourcePath.lastIndexOf('/')) : '';
+					return vault.getAbstractFileByPath(dir ? `${dir}/${linkPath}` : linkPath)
+						?? vault.getFiles().find((file) => file.name === linkPath) ?? null;
+				}
+			}
+		},
 		registerEvent() {},
 		registerDomEvent(target, type, handler) {
 			domEvents[type] = handler;
@@ -362,4 +375,34 @@ test('narrowing the scope while queued, or turning auto-upload off while process
 	switchedOff.settings.enableAutoUpload = false; // 处理期间关闭开关
 	await sleep(60);
 	assert.equal(switchedOff.vault.files.get('inbox/b.md').content, '![[local-b.png]]');
+});
+
+test('an unresolvable reference does not loop forever just because a same-named image exists elsewhere', async () => {
+	// 引用 ./img/local-x.png 解析不到，但 archive/ 下有同名文件
+	const { vault, imageHandler, watcher } = await setup({ autoUploadFolders: 'inbox' }, { unresolved: ['./img/local-x.png'] });
+	watcher.register();
+	vault.add('archive/local-x.png');
+	const note = vault.add('inbox/a.md', '![[./img/local-x.png]]');
+	vault.emit('modify', note);
+	await sleep(DEBOUNCE * 12);
+	assert.ok(imageHandler.calls.length <= 1, `expected no rerun, got ${imageHandler.calls.length}`);
+	assert.equal(vault.files.get('inbox/a.md').content, '![[./img/local-x.png]]');
+});
+
+test('a note moved out of scope while it is being processed is not written back', async () => {
+	const { vault, imageHandler, watcher } = await setup({ autoUploadFolders: 'inbox' }, { delayMs: 30 });
+	watcher.register();
+	const note = vault.add('inbox/a.md', '![[local-a.png]]');
+	vault.emit('modify', note);
+	await sleep(DEBOUNCE * 2);
+	assert.equal(imageHandler.calls.length, 1);
+	// 上传途中把笔记移到范围外目录（TFile.path 随之更新）
+	const entry = vault.files.get('inbox/a.md');
+	vault.files.delete('inbox/a.md');
+	note.path = 'archive/a.md';
+	vault.files.set('archive/a.md', entry);
+	vault.emit('rename', note, 'inbox/a.md');
+	await sleep(80);
+	assert.equal(vault.files.get('archive/a.md').content, '![[local-a.png]]');
+	assert.equal(imageHandler.calls.length, 1);
 });
