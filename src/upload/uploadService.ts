@@ -111,7 +111,9 @@ export class UploadService {
 
 			// 内容去重：命中索引直接复用旧链接，不再发请求
 			const dedupeKey = options.bypassDedupe ? null : await this.resolveDedupeKey(runtimeConfig.file);
-			if (dedupeKey) {
+			// 循环：命中索引直接复用；有同图请求在途就等它；它失败后重新回到循环顶部，
+			// 这样多个等待者会再次合并到「第一个重试者」的请求上，而不是各自重传。
+			while (dedupeKey) {
 				const cached = this.uploadIndex?.get(dedupeKey);
 				if (cached) {
 					this.debugLog(`CF ImageBed: reusing already uploaded image ${cached.src}`);
@@ -119,13 +121,13 @@ export class UploadService {
 					return { url: this.buildReturnUrl(cached.src), src: cached.src, reused: true };
 				}
 				const inFlight = this.inFlight.get(dedupeKey);
-				if (inFlight) {
-					const shared = await inFlight;
-					if (shared) {
-						this.notifyReused();
-						return { ...shared, reused: true };
-					}
-					// 并行的那次上传失败了，下面自己再传一次
+				if (!inFlight) {
+					break;
+				}
+				const shared = await inFlight;
+				if (shared) {
+					this.notifyReused();
+					return { ...shared, reused: true };
 				}
 			}
 
@@ -193,8 +195,10 @@ export class UploadService {
 			throw new Error(this.i18n.t('errors.serverResponseInvalid'));
 		}
 
-		// 只记录成功结果；写盘由索引串行化
-		if (dedupeKey && this.uploadIndex) {
+		// 只记录成功结果；写盘由索引串行化。
+		// 上传期间若用户改了图床/渠道/处理设置，键已不再对应本次实际发往的目标，则不记录，避免把
+		// 新图床的结果写进旧图床的命名空间。
+		if (dedupeKey && this.uploadIndex && dedupeKey === this.rebuildKey(dedupeKey)) {
 			void this.uploadIndex.set(dedupeKey, {
 				src,
 				name: runtimeConfig.file.name,
@@ -217,11 +221,13 @@ export class UploadService {
 
 	/** 根据返回格式设置把服务端 src 拼成最终链接（优先自定义前缀，否则回退到 API URL）。 */
 	buildReturnUrl(src: string): string {
-		if (this.settings.returnFormat === 'full' || /^https?:\/\//i.test(src)) {
+		// 绝对链接（returnFormat=full 时服务端直接返回完整 URL）原样返回；
+		// 相对 src 无论当前返回格式如何都要拼前缀——索引里可能存着旧格式下的相对 src。
+		if (/^https?:\/\//i.test(src)) {
 			return src;
 		}
-		const baseUrl = this.settings.customReturnBaseUrl?.trim() || this.settings.apiUrl;
-		return `${baseUrl}${src}`;
+		const baseUrl = (this.settings.customReturnBaseUrl?.trim() || this.settings.apiUrl).replace(/\/+$/, '');
+		return `${baseUrl}${src.startsWith('/') ? '' : '/'}${src}`;
 	}
 
 	/** 去重键：原始字节 SHA-256 + 目标命名空间 + 处理策略；去重关闭或哈希失败时返回 null。 */
@@ -236,6 +242,12 @@ export class UploadService {
 			console.warn('CF ImageBed: failed to hash image, uploading without dedupe', error);
 			return null;
 		}
+	}
+
+	/** 用当前设置重算同一哈希的键，用于检测上传期间设置是否变化。 */
+	private rebuildKey(previousKey: string): string {
+		const hash = previousKey.split('|')[0];
+		return buildUploadIndexKey(hash, buildUploadNamespace(this.settings), buildProcessingPolicy(this.settings));
 	}
 
 	private notifyReused(): void {

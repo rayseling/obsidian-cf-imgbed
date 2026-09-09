@@ -517,9 +517,13 @@ export class CFImageBedSettingTab extends PluginSettingTab {
 					if (!url) {
 						return;
 					}
-					// 索引里存的是服务端 src；接受完整链接或 src 两种输入
-					const src = this.toIndexSrc(url);
-					const removed = await this.plugin.uploadIndex.deleteBySrc(src);
+					// 索引里存的是服务端 src：默认返回格式下是相对路径，完整链接格式下是绝对 URL。
+					// 先按原文匹配，再按去掉前缀后的相对路径匹配，两种记录都能删掉。
+					let removed = await this.plugin.uploadIndex.deleteBySrc(url);
+					const stripped = this.toIndexSrc(url);
+					if (stripped !== url) {
+						removed += await this.plugin.uploadIndex.deleteBySrc(stripped);
+					}
 					new Notice(removed > 0
 						? this.i18n.t('settings.advanced.uploadIndex.removed', { count: removed })
 						: this.i18n.t('settings.advanced.uploadIndex.notFound'));
