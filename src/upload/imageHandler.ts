@@ -11,6 +11,7 @@ import {
 	extractPlainImageUrlReferences
 } from '../utils/imageReferences';
 import { getEffectiveExcludedDomains, isUrlExcluded } from '../utils/domainUtils';
+import { LocalImageCleaner, UploadedVaultImage } from './localImageCleaner';
 
 interface TextReplacement {
 	index: number;
@@ -33,6 +34,8 @@ export interface UploadImagesInTextResult {
 	skipped: number;
 	/** 在库内找不到的本地图片引用（可能尚未落盘），供监听器等待图片到达后重跑。 */
 	unresolvedLocal: string[];
+	/** 本次由库内文件成功上传的图片，供「上传后删除本地图片」在链接写回后核对并清理。 */
+	uploadedVaultFiles: UploadedVaultImage[];
 }
 
 type LocalImageSource =
@@ -45,7 +48,8 @@ export class ImageHandler {
         private app: App,
         private uploadService: UploadService,
         private getSettings?: () => CFImageBedSettings,
-        private i18n?: I18n
+        private i18n?: I18n,
+        private cleaner?: LocalImageCleaner
     ) {}
 
 	async uploadImageFromFile(file: File, deleteLocal = false): Promise<void> {
@@ -216,14 +220,22 @@ export class ImageHandler {
 		}
 
 		const replacements: TextReplacement[] = [];
+		const uploadedVaultFiles: UploadedVaultImage[] = [];
 		let successCount = 0;
 		let failedCount = 0;
 		const skippedCount = allReferences.length - uploadableReferences.length;
 
 		for (const reference of uploadableReferences) {
-			const uploadedUrl = reference.isRemote
-				? await this.uploadRemoteImage(reference.path, reference.altText, activeFile)
-				: await this.uploadLocalImageReference(reference, activeFile.path, activeFile);
+			let uploadedUrl: string | null;
+			if (reference.isRemote) {
+				uploadedUrl = await this.uploadRemoteImage(reference.path, reference.altText, activeFile);
+			} else {
+				const local = await this.uploadLocalImageReference(reference, activeFile.path, activeFile);
+				uploadedUrl = local?.url ?? null;
+				if (local?.vaultFile) {
+					this.rememberUploadedVaultFile(uploadedVaultFiles, local.vaultFile, local.src, local.url);
+				}
+			}
 
 			if (!uploadedUrl) {
 				failedCount++;
@@ -244,7 +256,14 @@ export class ImageHandler {
 		}
 
 		if (successCount > 0) {
+			// 清理器需要在写回之前就监听链接解析事件，否则可能漏掉 resolve
+			const cleanup = this.cleaner?.isEnabled() && uploadedVaultFiles.length > 0
+				? { cleaner: this.cleaner, waiter: this.cleaner.expectResolve(activeFile) }
+				: null;
 			this.setEditorValue(editor, this.applyReplacements(originalContent, replacements));
+			if (cleanup) {
+				void cleanup.cleaner.cleanupAfterWriteBack(uploadedVaultFiles, activeFile, cleanup.waiter);
+			}
 		}
 
 		this.showBatchUploadSummary(successCount, failedCount, skippedCount);
@@ -265,11 +284,12 @@ export class ImageHandler {
 		const { all: allReferences, uploadable: uploadableReferences } = this.selectUploadableReferences(originalContent);
 
 		if (uploadableReferences.length === 0) {
-			return { content: originalContent, success: 0, failed: 0, skipped: 0, unresolvedLocal: [] };
+			return { content: originalContent, success: 0, failed: 0, skipped: 0, unresolvedLocal: [], uploadedVaultFiles: [] };
 		}
 
 		const replacements: TextReplacement[] = [];
 		const unresolvedLocal: string[] = [];
+		const uploadedVaultFiles: UploadedVaultImage[] = [];
 		let successCount = 0;
 		let failedCount = 0;
 		let skippedCount = allReferences.length - uploadableReferences.length;
@@ -289,10 +309,14 @@ export class ImageHandler {
 					unresolvedLocal.push(reference.path);
 					continue;
 				}
-				uploadedUrl = await this.uploadService.uploadImage(source.file, {
+				const outcome = await this.uploadService.uploadImageDetailed(source.file, {
 					showErrorNotice: false,
 					noteFile: sourceFile
 				});
+				uploadedUrl = outcome?.url ?? null;
+				if (outcome && source.vaultFile) {
+					this.rememberUploadedVaultFile(uploadedVaultFiles, source.vaultFile, outcome.src, outcome.url);
+				}
 			}
 
 			if (!uploadedUrl) {
@@ -313,8 +337,16 @@ export class ImageHandler {
 			success: successCount,
 			failed: failedCount,
 			skipped: skippedCount,
-			unresolvedLocal
+			unresolvedLocal,
+			uploadedVaultFiles
 		};
+	}
+
+	/** 同一张库内图片在一篇笔记里被引用多次时只记录一次。 */
+	private rememberUploadedVaultFile(list: UploadedVaultImage[], file: TFile, src: string, url: string): void {
+		if (!list.some((item) => item.file.path === file.path)) {
+			list.push({ file, src, url });
+		}
 	}
 
 	/** 统计一段内容里可上传的图片引用数（不上传），用于批量迁移前的确认。 */
@@ -608,15 +640,16 @@ export class ImageHandler {
 		reference: ParsedImageReference,
 		sourcePath: string,
 		noteFile?: TFile | null
-	): Promise<string | null> {
+	): Promise<{ url: string; src: string; vaultFile: TFile | null } | null> {
 		const source = await this.resolveLocalImageSource(reference, sourcePath, true);
 		if (source.kind !== 'file') {
 			return null;
 		}
-		return this.uploadService.uploadImage(source.file, {
+		const outcome = await this.uploadService.uploadImageDetailed(source.file, {
 			showErrorNotice: false,
 			noteFile
 		});
+		return outcome ? { url: outcome.url, src: outcome.src, vaultFile: source.vaultFile } : null;
 	}
 
 	/**

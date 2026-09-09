@@ -577,6 +577,16 @@ export class CFImageBedSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
+		new Setting(container)
+			.setName(this.i18n.t('settings.advanced.deleteLocalAfterUpload.name'))
+			.setDesc(this.i18n.t('settings.advanced.deleteLocalAfterUpload.desc'))
+			.addToggle((toggle: ToggleComponent) => toggle
+				.setValue(this.plugin.settings.deleteLocalAfterUpload)
+				.onChange(async (value: boolean) => {
+					this.plugin.settings.deleteLocalAfterUpload = value;
+					await this.plugin.saveSettings();
+				}));
+
 		const autoExcludedDomains = getOwnImageBedHostnames(
 			this.plugin.settings.apiUrl,
 			this.plugin.settings.customReturnBaseUrl

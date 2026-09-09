@@ -44,6 +44,9 @@ export interface CFImageBedSettings {
 	autoUploadDebounceMs: number; // 文件改动后等待落定的防抖毫秒
 	autoUploadFolders: string; // 逗号分隔的监听文件夹；留空且未开启 autoUploadWholeVault 时不监听任何笔记
 	autoUploadWholeVault: boolean; // 显式开启才监听整个库（默认关，风险见设置说明）
+
+	// 上传后删除本地图片：链接写回并逐项核对（索引哈希、全库引用、远端可读）后，把库内原图移到回收站
+	deleteLocalAfterUpload: boolean;
 	
 	// 用户体验配置
 	showUploadProgress: boolean;
@@ -102,6 +105,9 @@ export const DEFAULT_SETTINGS: CFImageBedSettings = {
 	autoUploadDebounceMs: 2000,
 	autoUploadFolders: '',
 	autoUploadWholeVault: false,
+
+	// 上传后删除本地图片
+	deleteLocalAfterUpload: false,
 	
 	// 用户体验配置
 	showUploadProgress: true,

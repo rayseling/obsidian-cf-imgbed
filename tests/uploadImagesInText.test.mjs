@@ -68,6 +68,10 @@ function createHandler(vaultFiles, settings = {}) {
 		async uploadImage(file) {
 			this.uploads.push(file.name);
 			return `https://img.example/${file.name}`;
+		},
+		async uploadImageDetailed(file) {
+			const url = await this.uploadImage(file);
+			return { url, src: `/${file.name}`, reused: false };
 		}
 	};
 	const handler = new ImageHandler(createApp(vaultFiles), uploadService, () => ({

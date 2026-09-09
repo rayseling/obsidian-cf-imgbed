@@ -188,6 +188,10 @@ const translations: Record<Language, Translations> = {
 					desc: '文件停止改动多久后再处理，避免处理写到一半的内容。默认 2000，最小 500。处理中再次改动会在本轮结束后自动重跑',
 					placeholder: '2000'
 				},
+				deleteLocalAfterUpload: {
+					name: '上传后删除本地图片',
+					desc: '⚠ 开启后图床将成为图片的唯一副本。库内图片经「上传当前文档所有图片」或自动上云成功转存、链接写回并确认后，逐项核对：当前字节命中去重索引、全库（含 Canvas、所有打开的编辑器、全文按文件名搜索）无任何引用、远端链接可访问且为图片，全部通过并在删除前再复核一次，才把原图移到回收站（遵守 Obsidian 的“已删除文件”设置）。任一项不满足都保留原图并在通知里说明。需要“相同图片只上传一次”保持开启；与“本地备份”同时开启会在库内留下备份副本'
+				},
 				excludedImageDomains: {
 					name: '网络图片排除域名',
 					desc: '这些域名的图片链接不会重复上传，支持逗号或换行分隔。当前 API URL 域名会自动加入排除列表',
@@ -234,7 +238,8 @@ const translations: Record<Language, Translations> = {
 		commands: {
 			uploadImageMobile: '📷 拍照或相册选择',
 			uploadCurrentNoteImages: '上传当前文档所有图片到 CF ImageBed',
-			scanAndMigrateImages: '扫描并迁移图片到 CF ImageBed（按自动上云范围）'
+			scanAndMigrateImages: '扫描并迁移图片到 CF ImageBed（按自动上云范围）',
+			cleanupOrphanImages: '清理已上云且无引用的孤立图片（预览后确认）'
 		},
 		autoUpload: {
 			scopeWholeVault: '整个库',
@@ -244,6 +249,27 @@ const translations: Record<Language, Translations> = {
 			scanNothing: '范围「{scope}」内没有待转存的图片',
 			scanQueued: '已排队 {notes} 篇笔记，处理进度见通知',
 			confirm: '开始迁移',
+			cancel: '取消'
+		},
+		cleanup: {
+			summary: 'CF ImageBed：已清理 {deleted} 张本地图片，保留 {kept} 张{reasons}',
+			reasons: {
+				disabled: '功能未开启',
+				'dedupe-disabled': '去重索引已关闭',
+				'resolve-timeout': '等待链接解析超时',
+				missing: '文件已不存在',
+				'not-in-index': '当前字节不在上传索引中',
+				'hash-mismatch': '文件内容与已上传版本不同',
+				referenced: '仍被其他笔记/Canvas 引用',
+				'unsaved-edit': '打开的编辑器中仍有引用',
+				'remote-unverified': '远端链接验证失败',
+				error: '处理出错'
+			},
+			orphanConfirmTitle: '清理已上云的孤立图片',
+			orphanConfirmMessage: '找到 {count} 张库内图片：已成功上传到图床（字节命中索引）且全库没有任何引用。\n{preview}\n删除前会对每张图再次核对引用与远端可访问性，然后移到回收站。是否继续？',
+			orphanNone: '没有找到已上云且无引用的孤立图片',
+			orphanScanning: '正在扫描库内图片（需要读取并哈希每张图片）...',
+			confirm: '开始清理',
 			cancel: '取消'
 		},
 		menu: {
@@ -488,6 +514,10 @@ const translations: Record<Language, Translations> = {
 					desc: 'How long to wait after the last change before processing, so half-written content is never touched. Default 2000, minimum 500. A change made while a note is being processed re-runs it afterwards.',
 					placeholder: '2000'
 				},
+				deleteLocalAfterUpload: {
+					name: 'Delete local image after upload',
+					desc: '⚠ The image bed becomes the only copy. After a vault image is uploaded by “upload current note images” or auto-upload and the rewritten links are confirmed on disk, each image is checked: current bytes match the dedupe index, nothing in the vault references it (Canvas files, every open editor and a full-text search by file name included), and the remote link is reachable and is an image. Only when everything passes — re-checked once more right before deletion — is the original moved to the trash (following Obsidian’s “deleted files” setting). Otherwise it is kept and the notice says why. Requires “upload identical images only once”; combined with “local backup” a copy stays in the vault.'
+				},
 				excludedImageDomains: {
 					name: 'Excluded remote domains',
 					desc: 'Images from these domains will not be uploaded again. Separate domains with commas or new lines. The current API URL domain is always excluded automatically.',
@@ -534,7 +564,8 @@ const translations: Record<Language, Translations> = {
 		commands: {
 			uploadImageMobile: '📷 Take photo or choose from gallery',
 			uploadCurrentNoteImages: 'Upload current note images to CF ImageBed',
-			scanAndMigrateImages: 'Scan and migrate images to CF ImageBed (auto-upload scope)'
+			scanAndMigrateImages: 'Scan and migrate images to CF ImageBed (auto-upload scope)',
+			cleanupOrphanImages: 'Clean up uploaded, unreferenced orphan images (preview first)'
 		},
 		autoUpload: {
 			scopeWholeVault: 'whole vault',
@@ -544,6 +575,27 @@ const translations: Record<Language, Translations> = {
 			scanNothing: 'No images to migrate in scope “{scope}”',
 			scanQueued: 'Queued {notes} note(s); progress is shown as notices',
 			confirm: 'Start migration',
+			cancel: 'Cancel'
+		},
+		cleanup: {
+			summary: 'CF ImageBed: trashed {deleted} local image(s), kept {kept}{reasons}',
+			reasons: {
+				disabled: 'feature disabled',
+				'dedupe-disabled': 'dedupe index disabled',
+				'resolve-timeout': 'timed out waiting for link resolution',
+				missing: 'file no longer exists',
+				'not-in-index': 'current bytes not in the upload index',
+				'hash-mismatch': 'file differs from the uploaded version',
+				referenced: 'still referenced by a note/Canvas',
+				'unsaved-edit': 'still referenced in an open editor',
+				'remote-unverified': 'remote link could not be verified',
+				error: 'error while processing'
+			},
+			orphanConfirmTitle: 'Clean up uploaded orphan images',
+			orphanConfirmMessage: 'Found {count} vault image(s) that were uploaded to the image bed (bytes match the index) and are referenced nowhere in the vault.\n{preview}\nEach image is re-checked for references and remote availability right before it is moved to the trash. Continue?',
+			orphanNone: 'No uploaded, unreferenced orphan images found',
+			orphanScanning: 'Scanning vault images (each image is read and hashed)...',
+			confirm: 'Start cleanup',
 			cancel: 'Cancel'
 		},
 		menu: {

@@ -1,7 +1,9 @@
-import { MarkdownView, Plugin, getLanguage } from 'obsidian';
+import { MarkdownView, Notice, Plugin, getLanguage } from 'obsidian';
 import { CFImageBedSettings, DEFAULT_SETTINGS } from './src/types';
 import { UploadService } from './src/upload/uploadService';
 import { UploadIndex } from './src/upload/uploadIndex';
+import { LocalImageCleaner } from './src/upload/localImageCleaner';
+import { ConfirmModal } from './src/ui/confirmModal';
 import { ImageHandler } from './src/upload/imageHandler';
 import { EventHandlers } from './src/events/eventHandlers';
 import { AutoUploadWatcher } from './src/events/autoUploadWatcher';
@@ -12,6 +14,7 @@ import { parseDomainList } from './src/utils/domainUtils';
 export default class CFImageBedPlugin extends Plugin {
 	settings: CFImageBedSettings;
 	uploadIndex: UploadIndex;
+	private localImageCleaner: LocalImageCleaner;
 	private uploadService: UploadService;
 	private imageHandler: ImageHandler;
 	private eventHandlers: EventHandlers;
@@ -30,7 +33,15 @@ export default class CFImageBedPlugin extends Plugin {
 
 		// 初始化服务
 		this.uploadService = new UploadService(this.app, this.settings, this.uploadIndex);
-		this.imageHandler = new ImageHandler(this.app, this.uploadService, () => this.settings, this.i18n);
+		// 上传后删除本地图片：只有链接写回、索引核对、全库引用、远端验证全部通过才进回收站
+		this.localImageCleaner = new LocalImageCleaner(
+			this.app,
+			this.uploadIndex,
+			() => this.settings,
+			(src) => this.uploadService.buildReturnUrl(src),
+			this.i18n
+		);
+		this.imageHandler = new ImageHandler(this.app, this.uploadService, () => this.settings, this.i18n, this.localImageCleaner);
 		this.eventHandlers = new EventHandlers(this.imageHandler, this.i18n, () => this.settings);
 
 		// 注册事件处理器
@@ -41,8 +52,17 @@ export default class CFImageBedPlugin extends Plugin {
 
 		// 图片自动上云监听器：监听笔记改动，把图片转存到图床并改写链接。
 		// 在 onLayoutReady 之后再注册（避免启动时的全库 create 事件风暴），随后对监听范围补扫一次。
-		this.autoUploadWatcher = new AutoUploadWatcher(this, this.imageHandler, () => this.settings, this.i18n);
+		this.autoUploadWatcher = new AutoUploadWatcher(this, this.imageHandler, () => this.settings, this.i18n, this.localImageCleaner);
 		this.app.workspace.onLayoutReady(() => this.autoUploadWatcher.register());
+
+		// 手动：找出已上云（字节命中索引）且全库无引用的孤立图片，预览确认后逐张复核并移到回收站
+		this.addCommand({
+			id: 'cleanup-orphan-images',
+			name: this.i18n.t('commands.cleanupOrphanImages'),
+			callback: () => {
+				void this.cleanupOrphanImages();
+			}
+		});
 
 		// 手动：扫描监听范围（未配置时为整个库）内的现有笔记，确认后批量迁移图片
 		this.addCommand({
@@ -82,6 +102,26 @@ export default class CFImageBedPlugin extends Plugin {
 	onunload() {
 		// 取消所有待处理任务；已在途的上传结果不再写回文件
 		this.autoUploadWatcher?.unload();
+	}
+
+	private async cleanupOrphanImages(): Promise<void> {
+		new Notice(this.i18n.t('cleanup.orphanScanning'));
+		const orphans = await this.localImageCleaner.findOrphans();
+		if (orphans.length === 0) {
+			new Notice(this.i18n.t('cleanup.orphanNone'));
+			return;
+		}
+		const preview = orphans.slice(0, 8).map((item) => `• ${item.file.path}`).join('\n')
+			+ (orphans.length > 8 ? `\n…` : '');
+		new ConfirmModal(this.app, {
+			title: this.i18n.t('cleanup.orphanConfirmTitle'),
+			message: this.i18n.t('cleanup.orphanConfirmMessage', { count: orphans.length, preview }),
+			confirmText: this.i18n.t('cleanup.confirm'),
+			cancelText: this.i18n.t('cleanup.cancel'),
+			onConfirm: () => {
+				void this.localImageCleaner.cleanupOrphans(orphans);
+			}
+		}).open();
 	}
 
 

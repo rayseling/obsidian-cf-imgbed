@@ -3,6 +3,7 @@ import { ImageHandler } from '../upload/imageHandler';
 import { CFImageBedSettings } from '../types';
 import { I18n } from '../utils/i18n';
 import { ConfirmModal } from '../ui/confirmModal';
+import { LocalImageCleaner } from '../upload/localImageCleaner';
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif', 'apng', 'heic', 'heif', 'ico']);
 
@@ -73,7 +74,8 @@ export class AutoUploadWatcher {
 		private plugin: Plugin,
 		private imageHandler: ImageHandler,
 		private getSettings: () => CFImageBedSettings,
-		private i18n: I18n
+		private i18n: I18n,
+		private cleaner?: LocalImageCleaner
 	) {}
 
 	/** 在 workspace.onLayoutReady 回调里调用：注册事件并对监听范围补扫一次。 */
@@ -318,6 +320,10 @@ export class AutoUploadWatcher {
 				return;
 			}
 			if (result.success > 0) {
+				// 清理器需要在写回之前就监听链接解析事件，否则可能漏掉 resolve
+				const cleanup = this.cleaner?.isEnabled() && result.uploadedVaultFiles.length > 0
+					? { cleaner: this.cleaner, waiter: this.cleaner.expectResolve(file) }
+					: null;
 				// 条件写回：仅当磁盘内容仍等于处理快照时才覆盖；否则保留用户新内容并重跑。
 				const written = await vault.process(file, (current) =>
 					current === original ? result.content : current
@@ -332,7 +338,12 @@ export class AutoUploadWatcher {
 							file: file.name
 						}));
 					}
+					if (cleanup) {
+						// 链接已确认落盘，才允许进入清理流水线（等待解析 → 核对 → 远端验证 → 复核 → 回收站）
+						await cleanup.cleaner.cleanupAfterWriteBack(result.uploadedVaultFiles, file, cleanup.waiter);
+					}
 				} else {
+					cleanup?.waiter.dispose();
 					state.rerun = true;
 				}
 			}
