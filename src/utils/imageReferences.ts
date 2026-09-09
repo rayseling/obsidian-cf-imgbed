@@ -47,6 +47,9 @@ export function computeExcludedRanges(content: string): ExcludedRange[] {
 
 	let indented: { start: number; lastContentEnd: number } | null = null;
 	let previousBlank = true;
+	// 最近一个非空行是否处于列表上下文（列表项本身，或列表项下的缩进续行）。
+	// 列表项后空一行再缩进的内容是列表续行，不是缩进代码块。
+	let listContext = false;
 
 	for (const line of lines) {
 		const lineStart = offset;
@@ -66,8 +69,10 @@ export function computeExcludedRanges(content: string): ExcludedRange[] {
 			continue;
 		}
 
-		// 缩进代码块：前一行为空（或文档开头），本行缩进 ≥4 空格或一个 Tab；空行不打断，首个非缩进行结束
+		// 缩进代码块：前一行为空（或文档开头）、不在列表上下文中，本行缩进 ≥4 空格或一个 Tab；
+		// 空行不打断，首个非缩进行结束
 		const isIndentedLine = /^( {4,}|\t)/.test(line) && !blank;
+		const isListItem = /^\s{0,3}(?:[-*+]|\d+[.)])\s+/.test(line);
 		if (indented) {
 			if (isIndentedLine) {
 				indented.lastContentEnd = lineEnd;
@@ -81,10 +86,13 @@ export function computeExcludedRanges(content: string): ExcludedRange[] {
 			segmentStart = indented.lastContentEnd;
 			indented = null;
 		}
-		if (isIndentedLine && previousBlank) {
+		if (isIndentedLine && previousBlank && !listContext) {
 			indented = { start: lineStart, lastContentEnd: lineEnd };
 			previousBlank = false;
 			continue;
+		}
+		if (!blank) {
+			listContext = isListItem || (isIndentedLine && listContext) || (/^\s+/.test(line) && listContext);
 		}
 
 		const openMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);

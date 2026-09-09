@@ -113,8 +113,30 @@ test('indented code blocks (4 spaces / tab after a blank line) are excluded, lis
 		'- item',
 		'    ![list-child](child.png)',
 		'',
+		'A paragraph closes the list.',
+		'',
 		'\t![tab](tab.png)',
 		'![end](end.png)'
 	].join('\n');
 	assert.deepEqual(paths(extractMarkdownAndWikiImageReferences(content)), ['top.png', 'after.png', 'child.png', 'end.png']);
+});
+
+test('indented content after a blank line inside a list item is a list continuation, not code', () => {
+	const content = [
+		'- item',
+		'',
+		'    ![photo](photo.png)',
+		'',
+		'    more text ![[second.png]]',
+		'',
+		'Paragraph ends the list.',
+		'',
+		'    ![real-code](code.png)'
+	].join('\n');
+	assert.deepEqual(paths(extractMarkdownAndWikiImageReferences(content)), ['photo.png', 'second.png']);
+});
+
+test('ordered list items and nested lists keep their indented images', () => {
+	const content = ['1. first', '', '    ![a](a.png)', '   - nested', '', '      ![b](b.png)'].join('\n');
+	assert.deepEqual(paths(extractMarkdownAndWikiImageReferences(content)), ['a.png', 'b.png']);
 });
