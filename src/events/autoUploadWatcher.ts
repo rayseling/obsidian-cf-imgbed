@@ -17,6 +17,10 @@ interface FileState {
 	processing: boolean;
 	/** 处理期间又收到改动 / 条件写回被拒绝 → 本轮结束后重新排队。 */
 	rerun: boolean;
+	/** 由手动「扫描并迁移」发起：重跑 / 重试时保留，不受「图片自动上云」开关约束。 */
+	manual: boolean;
+	/** 连续上传失败次数，用于有限退避重试；成功后清零。 */
+	attempts: number;
 }
 
 interface QueueItem {
@@ -43,12 +47,15 @@ interface QueueItem {
 export class AutoUploadWatcher {
 	static maxConcurrent = 2;
 	static minDebounceMs = 500;
+	/** 上传失败后的退避重试间隔；用尽后进入 exhausted，等网络恢复（online 事件）或下一次改动。 */
+	static retryDelaysMs = [5000, 30000, 120000];
 
 	private states = new Map<string, FileState>();
 	private queue: QueueItem[] = [];
 	private queued = new Set<string>();
 	private active = 0;
 	private waitingForImage = new Map<string, Set<string>>();
+	private exhausted = new Set<string>();
 	private disposed = false;
 
 	constructor(
@@ -66,6 +73,10 @@ export class AutoUploadWatcher {
 		this.plugin.registerEvent(vault.on('modify', (file) => this.onVaultChange(file)));
 		this.plugin.registerEvent(vault.on('rename', (file, oldPath) => this.onRename(file, oldPath)));
 		this.plugin.registerEvent(vault.on('delete', (file) => this.onDelete(file)));
+		if (typeof window !== 'undefined') {
+			// 网络恢复：把退避用尽的笔记重新排队
+			this.plugin.registerDomEvent(window, 'online', () => this.onOnline());
+		}
 
 		const settings = this.getSettings();
 		const scope = settings?.enableAutoUpload ? resolveAutoUploadScope(settings) : null;
@@ -85,6 +96,16 @@ export class AutoUploadWatcher {
 		this.queue = [];
 		this.queued.clear();
 		this.waitingForImage.clear();
+		this.exhausted.clear();
+	}
+
+	private onOnline(): void {
+		for (const path of Array.from(this.exhausted)) {
+			this.exhausted.delete(path);
+			const state = this.getState(path);
+			state.attempts = 0;
+			this.schedule(path, state.manual);
+		}
 	}
 
 	/** 命令：统计范围内待转存图片 → 确认 → 排队处理。未配置范围时按整个库处理，并在对话框里说明。 */
@@ -183,6 +204,7 @@ export class AutoUploadWatcher {
 		}
 		this.queue = this.queue.filter((item) => item.path !== oldPath);
 		this.queued.delete(oldPath);
+		this.exhausted.delete(oldPath);
 		// 改名后的文件按新路径重新走一遍范围判断
 		this.onVaultChange(file);
 	}
@@ -195,6 +217,7 @@ export class AutoUploadWatcher {
 		this.states.delete(file.path);
 		this.queue = this.queue.filter((item) => item.path !== file.path);
 		this.queued.delete(file.path);
+		this.exhausted.delete(file.path);
 	}
 
 	private onImageArrived(image: TFile): void {
@@ -225,7 +248,7 @@ export class AutoUploadWatcher {
 	private getState(path: string): FileState {
 		let state = this.states.get(path);
 		if (!state) {
-			state = { timer: null, processing: false, rerun: false };
+			state = { timer: null, processing: false, rerun: false, manual: false, attempts: 0 };
 			this.states.set(path, state);
 		}
 		return state;
@@ -236,11 +259,12 @@ export class AutoUploadWatcher {
 		return Math.max(AutoUploadWatcher.minDebounceMs, settings?.autoUploadDebounceMs ?? 2000);
 	}
 
-	private schedule(path: string): void {
+	private schedule(path: string, manual = false, delayMs?: number): void {
 		if (this.disposed) {
 			return;
 		}
 		const state = this.getState(path);
+		state.manual = state.manual || manual;
 		if (state.processing) {
 			state.rerun = true;
 			return;
@@ -250,8 +274,26 @@ export class AutoUploadWatcher {
 		}
 		state.timer = setTimeout(() => {
 			state.timer = null;
-			this.enqueue(path, false);
-		}, this.debounceDelay());
+			this.enqueue(path, state.manual);
+		}, delayMs ?? this.debounceDelay());
+	}
+
+	/** 非手动任务在处理前和写回前都要再确认：开关仍开、路径仍在范围内。 */
+	private isStillWatched(path: string): boolean {
+		const settings = this.getSettings();
+		if (!settings?.enableAutoUpload) {
+			return false;
+		}
+		const scope = resolveAutoUploadScope(settings);
+		return scope !== null && isPathInScope(path, scope);
+	}
+
+	private findVaultFileByBasename(referencePath: string): boolean {
+		const key = imageBasename(referencePath);
+		if (!key) {
+			return false;
+		}
+		return this.plugin.app.vault.getFiles().some((file) => file.name.toLowerCase() === key);
 	}
 
 	private enqueue(path: string, manual: boolean): void {
@@ -280,8 +322,8 @@ export class AutoUploadWatcher {
 			return;
 		}
 		const settings = this.getSettings();
-		if (!item.manual && !settings?.enableAutoUpload) {
-			return;
+		if (!item.manual && !this.isStillWatched(item.path)) {
+			return; // 排队期间开关被关掉或范围被缩小
 		}
 		const vault = this.plugin.app.vault;
 		const file = vault.getAbstractFileByPath(item.path);
@@ -292,6 +334,8 @@ export class AutoUploadWatcher {
 		const state = this.getState(item.path);
 		state.processing = true;
 		state.rerun = false;
+		state.manual = state.manual || item.manual;
+		let retryDelay: number | null = null;
 		try {
 			const original = await vault.read(file);
 			const result = await this.imageHandler.uploadImagesInText(original, file, file.path, {
@@ -299,6 +343,23 @@ export class AutoUploadWatcher {
 			});
 			if (this.disposed) {
 				return;
+			}
+			if (!state.manual && !this.isStillWatched(item.path)) {
+				return; // 处理期间开关被关掉：不写回
+			}
+			// 网络/上传失败（不含「库内找不到图片」）→ 有限退避重试
+			const uploadFailures = result.failed - result.unresolvedLocal.length;
+			if (uploadFailures > 0) {
+				const delay = AutoUploadWatcher.retryDelaysMs[state.attempts];
+				state.attempts++;
+				if (delay !== undefined) {
+					retryDelay = delay;
+				} else {
+					this.exhausted.add(item.path);
+				}
+			} else {
+				state.attempts = 0;
+				this.exhausted.delete(item.path);
 			}
 			if (result.success > 0) {
 				// 清理器需要在写回之前就监听链接解析事件，否则可能漏掉 resolve
@@ -329,7 +390,12 @@ export class AutoUploadWatcher {
 				}
 			}
 			for (const unresolved of result.unresolvedLocal) {
-				this.waitForImage(unresolved, file.path);
+				// 图片可能在我们登记等待之前就已落盘（create 事件已错过）：此时直接重跑，否则登记等待
+				if (this.findVaultFileByBasename(unresolved)) {
+					state.rerun = true;
+				} else {
+					this.waitForImage(unresolved, file.path);
+				}
 			}
 		} catch (error) {
 			console.error('CF ImageBed auto-upload failed:', error);
@@ -340,8 +406,10 @@ export class AutoUploadWatcher {
 			}
 			if (state.rerun) {
 				state.rerun = false;
-				this.schedule(item.path);
-			} else if (!state.timer) {
+				this.schedule(item.path, state.manual);
+			} else if (retryDelay !== null) {
+				this.schedule(item.path, state.manual, retryDelay);
+			} else if (!state.timer && !this.exhausted.has(item.path)) {
 				this.states.delete(item.path);
 			}
 		}
