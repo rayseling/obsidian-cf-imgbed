@@ -45,6 +45,8 @@ await build({
 const { AutoUploadWatcher, resolveAutoUploadScope, isPathInScope, TFile } = await import(pathToFileURL(bundlePath).href);
 
 AutoUploadWatcher.minDebounceMs = 10;
+AutoUploadWatcher.retryDelaysMs = [15, 15];
+globalThis.window ??= {}; // 让监听器注册 online 事件
 const DEBOUNCE = 10;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -73,6 +75,9 @@ function createVault() {
 		getMarkdownFiles() {
 			return Array.from(files.values()).map((entry) => entry.file).filter((file) => file.extension === 'md');
 		},
+		getFiles() {
+			return Array.from(files.values()).map((entry) => entry.file);
+		},
 		async read(file) {
 			return files.get(file.path).content;
 		},
@@ -91,26 +96,38 @@ function createVault() {
 	};
 }
 
-function createImageHandler({ delayMs = 0, unresolved = [] } = {}) {
+function createImageHandler({ delayMs = 0, unresolved = [], failUploads = 0, onCall = null } = {}) {
 	return {
 		calls: [],
 		activeNow: 0,
 		maxActive: 0,
 		delayMs,
 		unresolved,
+		/** 前 N 次调用模拟网络失败：图片存在但上传失败 */
+		failUploads,
+		onCall,
 		countUploadableImages(content) {
 			return (content.match(/!\[\[local-[^\]]+\]\]/g) ?? []).length;
 		},
 		async uploadImagesInText(content, file, sourcePath, options) {
 			this.calls.push({ content, sourcePath, options });
+			// 先按调用时的状态决定结果（模拟真实解析发生在处理开始时），再触发 onCall
+			const matches = content.match(/!\[\[local-[^\]]+\]\]/g) ?? [];
+			const unresolvedLocal = this.unresolved.filter((name) => content.includes(name));
+			const failThisCall = this.failUploads > 0;
+			if (failThisCall) {
+				this.failUploads--;
+			}
+			this.onCall?.(this.calls.length);
 			this.activeNow++;
 			this.maxActive = Math.max(this.maxActive, this.activeNow);
 			if (this.delayMs > 0) {
 				await sleep(this.delayMs);
 			}
 			this.activeNow--;
-			const matches = content.match(/!\[\[local-[^\]]+\]\]/g) ?? [];
-			const unresolvedLocal = this.unresolved.filter((name) => content.includes(name));
+			if (failThisCall) {
+				return { content, success: 0, failed: matches.length, skipped: 0, unresolvedLocal: [] };
+			}
 			const rewritten = content.replace(/!\[\[local-([^\]|]+)(?:\|[^\]]*)?\]\]/g, '![$1](https://img.example/$1)');
 			return {
 				content: rewritten,
@@ -135,15 +152,19 @@ async function setup(settingsOverrides = {}, handlerOptions = {}) {
 		...settingsOverrides
 	};
 	const imageHandler = createImageHandler(handlerOptions);
+	const domEvents = {};
 	const plugin = {
 		app: { vault },
-		registerEvent() {}
+		registerEvent() {},
+		registerDomEvent(target, type, handler) {
+			domEvents[type] = handler;
+		}
 	};
 	const i18n = { t: (key, params) => `${key} ${JSON.stringify(params ?? {})}` };
 	const watcher = new AutoUploadWatcher(plugin, imageHandler, () => settings, i18n);
 	globalThis.__notices = [];
 	globalThis.__modalButtons = [];
-	return { vault, settings, imageHandler, watcher };
+	return { vault, settings, imageHandler, watcher, domEvents };
 }
 
 test('scope resolution: empty folders without whole-vault means no watching', () => {
@@ -265,4 +286,80 @@ test('manual scan counts the scope, asks for confirmation, and processes even wh
 	assert.equal(vault.files.get('b.md').content, 'no images');
 	assert.equal(vault.files.get('a.md').content, '![a.png](https://img.example/a.png)\n![b.png](https://img.example/b.png)');
 	assert.ok(globalThis.__notices.some((message) => message.startsWith('autoUpload.scanQueued')));
+});
+
+test('upload failures are retried with bounded backoff, then resumed by the online event', async () => {
+	const { vault, imageHandler, watcher, domEvents } = await setup({ autoUploadFolders: 'inbox' }, { failUploads: 5 });
+	watcher.register();
+	const note = vault.add('inbox/a.md', '![[local-a.png]]');
+	vault.emit('modify', note);
+	await sleep(120);
+	// 首次 + retryDelaysMs 长度（2）次重试 = 3 次后停止，不无限重试
+	assert.equal(imageHandler.calls.length, 3);
+	assert.equal(vault.files.get('inbox/a.md').content, '![[local-a.png]]');
+
+	imageHandler.failUploads = 0;
+	assert.ok(domEvents.online, 'online handler must be registered');
+	domEvents.online();
+	await sleep(DEBOUNCE * 4);
+	assert.equal(imageHandler.calls.length, 4);
+	assert.equal(vault.files.get('inbox/a.md').content, '![a.png](https://img.example/a.png)');
+});
+
+test('a manual scan keeps its manual flag across a write-back conflict even when auto-upload is off', async () => {
+	const { vault, imageHandler, watcher } = await setup({ enableAutoUpload: false, autoUploadFolders: '' }, { delayMs: 30 });
+	watcher.register();
+	const note = vault.add('a.md', '![[local-a.png]]');
+	await watcher.scanAndMigrate();
+	globalThis.__modalButtons[1]();
+	await sleep(10);
+	// 处理期间用户改了笔记 → 条件写回失败 → 重跑必须仍以手动身份进行
+	vault.files.get('a.md').content = '![[local-a.png]]\n![[local-b.png]]';
+	vault.emit('modify', note);
+	await sleep(120);
+	assert.ok(imageHandler.calls.length >= 2);
+	assert.equal(vault.files.get('a.md').content, '![a.png](https://img.example/a.png)\n![b.png](https://img.example/b.png)');
+});
+
+test('an image that lands while the note is being processed (before the wait is registered) is not missed', async () => {
+	let ctx = null;
+	const handlerOptions = {
+		unresolved: ['local-late.png'],
+		onCall: (n) => {
+			if (n === 1) {
+				// 图片在第一次处理期间落盘，create 事件此时还没有等待者
+				const image = ctx.vault.add('inbox/local-late.png');
+				ctx.vault.emit('create', image);
+				ctx.imageHandler.unresolved = [];
+			}
+		}
+	};
+	ctx = await setup({ autoUploadFolders: 'inbox' }, handlerOptions);
+	ctx.watcher.register();
+	const note = ctx.vault.add('inbox/a.md', '![[local-late.png]]');
+	ctx.vault.emit('modify', note);
+	await sleep(DEBOUNCE * 6);
+	assert.equal(ctx.imageHandler.calls.length, 2);
+	assert.equal(ctx.vault.files.get('inbox/a.md').content, '![late.png](https://img.example/late.png)');
+});
+
+test('narrowing the scope while queued, or turning auto-upload off while processing, prevents the write-back', async () => {
+	const narrowed = await setup({ autoUploadFolders: 'inbox' });
+	narrowed.watcher.register();
+	const note = narrowed.vault.add('inbox/a.md', '![[local-a.png]]');
+	narrowed.vault.emit('modify', note);
+	narrowed.settings.autoUploadFolders = 'other'; // 排队期间缩小范围
+	await sleep(DEBOUNCE * 4);
+	assert.equal(narrowed.imageHandler.calls.length, 0);
+	assert.equal(narrowed.vault.files.get('inbox/a.md').content, '![[local-a.png]]');
+
+	const switchedOff = await setup({ autoUploadFolders: 'inbox' }, { delayMs: 30 });
+	switchedOff.watcher.register();
+	const note2 = switchedOff.vault.add('inbox/b.md', '![[local-b.png]]');
+	switchedOff.vault.emit('modify', note2);
+	await sleep(DEBOUNCE * 2);
+	assert.equal(switchedOff.imageHandler.calls.length, 1);
+	switchedOff.settings.enableAutoUpload = false; // 处理期间关闭开关
+	await sleep(60);
+	assert.equal(switchedOff.vault.files.get('inbox/b.md').content, '![[local-b.png]]');
 });
