@@ -45,11 +45,11 @@ export function computeExcludedRanges(content: string): ExcludedRange[] {
 	const plainSegments: ExcludedRange[] = [];
 	let segmentStart = 0;
 
-	let indented: { start: number; lastContentEnd: number } | null = null;
+	let indented: { start: number; lastContentEnd: number; threshold: number } | null = null;
 	let previousBlank = true;
-	// 最近一个非空行是否处于列表上下文（列表项本身，或列表项下的缩进续行）。
-	// 列表项后空一行再缩进的内容是列表续行，不是缩进代码块。
-	let listContext = false;
+	// 列表内容的缩进基准（列表项标记之后内容开始的列）；-1 = 不在列表中。
+	// 列表内：缩进 ≥ 基准 是续行；缩进 ≥ 基准 + 4 且前一行为空 才是列表内的缩进代码块。
+	let listContentIndent = -1;
 
 	for (const line of lines) {
 		const lineStart = offset;
@@ -69,12 +69,14 @@ export function computeExcludedRanges(content: string): ExcludedRange[] {
 			continue;
 		}
 
-		// 缩进代码块：前一行为空（或文档开头）、不在列表上下文中，本行缩进 ≥4 空格或一个 Tab；
-		// 空行不打断，首个非缩进行结束
-		const isIndentedLine = /^( {4,}|\t)/.test(line) && !blank;
-		const isListItem = /^\s{0,3}(?:[-*+]|\d+[.)])\s+/.test(line);
+		// 缩进代码块：前一行为空（或文档开头），本行缩进达到阈值（文档级 4；列表内为基准 + 4）；
+		// 空行不打断，首个缩进不足的行结束
+		const indentWidth = leadingIndentWidth(line);
+		const codeThreshold = listContentIndent >= 0 ? listContentIndent + 4 : 4;
+		const listItemMatch = blank ? null : line.match(/^(\s*)([-*+]|\d+[.)])(\s+)\S/);
+		const isListItemLine = listItemMatch !== null && indentWidth < codeThreshold;
 		if (indented) {
-			if (isIndentedLine) {
+			if (!blank && indentWidth >= indented.threshold) {
 				indented.lastContentEnd = lineEnd;
 				continue;
 			}
@@ -86,13 +88,20 @@ export function computeExcludedRanges(content: string): ExcludedRange[] {
 			segmentStart = indented.lastContentEnd;
 			indented = null;
 		}
-		if (isIndentedLine && previousBlank && !listContext) {
-			indented = { start: lineStart, lastContentEnd: lineEnd };
+		if (!blank && indentWidth >= codeThreshold && previousBlank && !isListItemLine) {
+			indented = { start: lineStart, lastContentEnd: lineEnd, threshold: codeThreshold };
 			previousBlank = false;
 			continue;
 		}
 		if (!blank) {
-			listContext = isListItem || (isIndentedLine && listContext) || (/^\s+/.test(line) && listContext);
+			if (isListItemLine && listItemMatch) {
+				// 内容列 = 缩进 + 标记宽度 + 标记后的空格（≥5 个空格时按 1 个算，其余是内容自身的缩进）
+				const gap = listItemMatch[3].length >= 5 ? 1 : listItemMatch[3].length;
+				listContentIndent = indentWidth + listItemMatch[2].length + gap;
+			} else if (listContentIndent >= 0 && indentWidth < listContentIndent && previousBlank) {
+				listContentIndent = -1; // 空行后出现缩进不足的普通段落：列表结束
+			}
+			// 其余情况：列表内的续行（缩进足够）或懒续行（无空行），保持当前列表基准
 		}
 
 		const openMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
@@ -120,6 +129,21 @@ export function computeExcludedRanges(content: string): ExcludedRange[] {
 	}
 
 	return ranges.sort((left, right) => left.start - right.start);
+}
+
+/** 行首缩进宽度：Tab 按 4 列计。 */
+function leadingIndentWidth(line: string): number {
+	let width = 0;
+	for (const char of line) {
+		if (char === ' ') {
+			width++;
+		} else if (char === '\t') {
+			width += 4 - (width % 4);
+		} else {
+			break;
+		}
+	}
+	return width;
 }
 
 function collectInlineExclusions(content: string, start: number, end: number, ranges: ExcludedRange[]): void {

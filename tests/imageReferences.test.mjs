@@ -140,3 +140,36 @@ test('ordered list items and nested lists keep their indented images', () => {
 	const content = ['1. first', '', '    ![a](a.png)', '   - nested', '', '      ![b](b.png)'].join('\n');
 	assert.deepEqual(paths(extractMarkdownAndWikiImageReferences(content)), ['a.png', 'b.png']);
 });
+
+test('inside a list, content indented 4+ columns past the item content column after a blank line is code', () => {
+	const content = [
+		'- item',
+		'',
+		'      ![code](code.png)',
+		'',
+		'    ![continuation](cont.png)',
+		'1. numbered',
+		'',
+		'       ![code2](code2.png)',
+		'',
+		'   ![cont2](cont2.png)'
+	].join('\n');
+	assert.deepEqual(paths(extractMarkdownAndWikiImageReferences(content)), ['cont.png', 'cont2.png']);
+});
+
+test('nested list items reset the indentation baseline', () => {
+	const content = [
+		'- parent',
+		'  - child',
+		'',
+		'    ![child-cont](child.png)',
+		'',
+		'        ![child-code](child-code.png)',
+		'- parent2',
+		'',
+		'    ![parent-cont](parent.png)',
+		'',
+		'      ![parent-code](parent-code.png)'
+	].join('\n');
+	assert.deepEqual(paths(extractMarkdownAndWikiImageReferences(content)), ['child.png', 'parent.png']);
+});
