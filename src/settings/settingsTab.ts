@@ -1,4 +1,4 @@
-import { App, DropdownComponent, PluginSettingTab, Setting, SliderComponent, TextComponent, ToggleComponent, getLanguage } from 'obsidian';
+import { App, DropdownComponent, Notice, PluginSettingTab, Setting, SliderComponent, TextComponent, ToggleComponent, getLanguage } from 'obsidian';
 import CFImageBedPlugin from '../../main';
 import { I18n, resolveLanguage } from '../utils/i18n';
 import { UploadChannel, UPLOAD_CHANNELS, Language, LANGUAGES } from '../types';
@@ -14,6 +14,19 @@ export class CFImageBedSettingTab extends PluginSettingTab {
 
 	private isUploadChannel(value: string): value is UploadChannel {
 		return (UPLOAD_CHANNELS as readonly string[]).includes(value);
+	}
+
+	/** 把用户输入的完整链接还原成索引里保存的服务端 src（去掉自定义前缀或 API URL）。 */
+	private toIndexSrc(input: string): string {
+		const prefixes = [this.plugin.settings.customReturnBaseUrl, this.plugin.settings.apiUrl]
+			.map((value) => (value || '').trim().replace(/\/+$/, ''))
+			.filter((value) => value.length > 0);
+		for (const prefix of prefixes) {
+			if (input.startsWith(prefix + '/')) {
+				return input.slice(prefix.length);
+			}
+		}
+		return input;
 	}
 
 	constructor(app: App, plugin: CFImageBedPlugin) {
@@ -477,6 +490,48 @@ export class CFImageBedSettingTab extends PluginSettingTab {
 				.onChange(async (value: boolean) => {
 					this.plugin.settings.enableExcalidrawUpload = value;
 					await this.plugin.saveSettings();
+				}));
+
+		new Setting(container)
+			.setName(this.i18n.t('settings.advanced.enableUploadDedupe.name'))
+			.setDesc(this.i18n.t('settings.advanced.enableUploadDedupe.desc'))
+			.addToggle((toggle: ToggleComponent) => toggle
+				.setValue(this.plugin.settings.enableUploadDedupe)
+				.onChange(async (value: boolean) => {
+					this.plugin.settings.enableUploadDedupe = value;
+					await this.plugin.saveSettings();
+				}));
+
+		let removeUrlInput: TextComponent | null = null;
+		new Setting(container)
+			.setName(this.i18n.t('settings.advanced.uploadIndex.name'))
+			.setDesc(this.i18n.t('settings.advanced.uploadIndex.desc', { count: this.plugin.uploadIndex.size }))
+			.addText((text: TextComponent) => {
+				removeUrlInput = text;
+				text.setPlaceholder(this.i18n.t('settings.advanced.uploadIndex.removePlaceholder'));
+			})
+			.addButton((button) => button
+				.setButtonText(this.i18n.t('settings.advanced.uploadIndex.remove'))
+				.onClick(async () => {
+					const url = removeUrlInput?.getValue().trim() ?? '';
+					if (!url) {
+						return;
+					}
+					// 索引里存的是服务端 src；接受完整链接或 src 两种输入
+					const src = this.toIndexSrc(url);
+					const removed = await this.plugin.uploadIndex.deleteBySrc(src);
+					new Notice(removed > 0
+						? this.i18n.t('settings.advanced.uploadIndex.removed', { count: removed })
+						: this.i18n.t('settings.advanced.uploadIndex.notFound'));
+					this.display();
+				}))
+			.addButton((button) => button
+				.setButtonText(this.i18n.t('settings.advanced.uploadIndex.clear'))
+				.setWarning()
+				.onClick(async () => {
+					await this.plugin.uploadIndex.clear();
+					new Notice(this.i18n.t('settings.advanced.uploadIndex.cleared'));
+					this.display();
 				}));
 
 		const autoExcludedDomain = extractHostname(this.plugin.settings.apiUrl);

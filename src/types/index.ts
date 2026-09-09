@@ -35,7 +35,10 @@ export interface CFImageBedSettings {
 	enableNetworkImageUpload: boolean;
 	enableExcalidrawUpload: boolean;
 	excludedImageDomains: string[];
-	
+
+	// 上传去重：相同字节的图片只上传一次，之后复用已有链接
+	enableUploadDedupe: boolean;
+
 	// 用户体验配置
 	showUploadProgress: boolean;
 	showSuccessNotification: boolean;
@@ -84,7 +87,10 @@ export const DEFAULT_SETTINGS: CFImageBedSettings = {
 	enableNetworkImageUpload: false,
 	enableExcalidrawUpload: true,
 	excludedImageDomains: [],
-	
+
+	// 上传去重
+	enableUploadDedupe: true,
+
 	// 用户体验配置
 	showUploadProgress: true,
 	showSuccessNotification: true,

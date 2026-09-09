@@ -1,6 +1,7 @@
 import { MarkdownView, Plugin, getLanguage } from 'obsidian';
 import { CFImageBedSettings, DEFAULT_SETTINGS } from './src/types';
 import { UploadService } from './src/upload/uploadService';
+import { UploadIndex } from './src/upload/uploadIndex';
 import { ImageHandler } from './src/upload/imageHandler';
 import { EventHandlers } from './src/events/eventHandlers';
 import { CFImageBedSettingTab } from './src/settings/settingsTab';
@@ -9,6 +10,7 @@ import { parseDomainList } from './src/utils/domainUtils';
 
 export default class CFImageBedPlugin extends Plugin {
 	settings: CFImageBedSettings;
+	uploadIndex: UploadIndex;
 	private uploadService: UploadService;
 	private imageHandler: ImageHandler;
 	private eventHandlers: EventHandlers;
@@ -20,8 +22,12 @@ export default class CFImageBedPlugin extends Plugin {
 		// 初始化i18n
 		this.i18n = new I18n(this.settings.language || resolveLanguage(getLanguage()));
 
+		// 上传去重索引：存放在插件目录下，独立于 data.json，避免与设置保存互相覆盖
+		this.uploadIndex = new UploadIndex(this.app.vault.adapter, `${this.manifest.dir}/upload-index.json`);
+		await this.uploadIndex.load();
+
 		// 初始化服务
-		this.uploadService = new UploadService(this.app, this.settings);
+		this.uploadService = new UploadService(this.app, this.settings, this.uploadIndex);
 		this.imageHandler = new ImageHandler(this.app, this.uploadService, () => this.settings, this.i18n);
 		this.eventHandlers = new EventHandlers(this.imageHandler, this.i18n, () => this.settings);
 
