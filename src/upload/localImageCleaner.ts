@@ -41,6 +41,17 @@ export interface ResolveWaiter {
 
 type Fetcher = typeof requestUrl;
 
+/** 最终阶段的变化守卫：期间库、元数据、编辑器或布局有任何变化都中止本次删除。 */
+interface ChangeGuard {
+	readonly changed: boolean;
+	stop(): void;
+}
+
+interface EventSource {
+	on(name: string, callback: (...args: unknown[]) => unknown): EventRef;
+	offref(ref: EventRef): void;
+}
+
 interface FileStamp {
 	mtime: number;
 	size: number;
@@ -58,8 +69,12 @@ interface FileStamp {
  *     哈希放在本地检查的最后一步，异步全库扫描之后。
  *  4. 远端验证：HEAD/GET 必须 200，且 Content-Type 为 image/*，或 GET 响应体带有图片魔数；
  *     无法确认类型不放行。
- *  5. 远端验证有网络等待，结束后把 2、3 再做一遍，进回收站前再核对一次 mtime/size，
- *     然后 fileManager.trashFile（遵守 Obsidian 的删除设置）。
+ *  5. 远端验证有网络等待，结束后把 2、3 再做一遍；这一轮全程有变化守卫（库文件事件、元数据事件、
+ *     编辑器改动、布局变化），任何变化都中止本次删除；再核对一次 mtime/size，然后
+ *     fileManager.trashFile（遵守 Obsidian 的删除设置）。
+ *
+ * 已知限制：getViewData() 返回的是视图当前数据，是否包含尚未落盘的最新编辑取决于该视图的实现；
+ * Excalidraw 等第三方视图需在真实环境验证。
  *
  * 孤立图片清理（命令）走同一条流水线，只是把「本次上传」换成「当前字节命中索引」。
  */
@@ -179,33 +194,69 @@ export class LocalImageCleaner {
 				report.kept.push({ path, reason: 'remote-unverified' });
 				return;
 			}
-			// 远端验证期间本地图片或引用可能已变化：进回收站前再完整复核一次
-			const recheck = await this.check(image);
-			if (recheck.reason) {
-				report.kept.push({ path, reason: recheck.reason });
-				return;
+			// 远端验证期间本地图片或引用可能已变化：进回收站前再完整复核一次。
+			// 复核全程受变化守卫保护：期间任何文件/元数据/编辑器/布局事件（包括同路径被换成
+			// 大小与 mtime 都相同的新内容、别的编辑器新增引用）都会中止本次删除，留待下一轮。
+			const guard = this.startChangeGuard();
+			try {
+				const recheck = await this.check(image);
+				if (recheck.reason) {
+					report.kept.push({ path, reason: recheck.reason });
+					return;
+				}
+				if (guard.changed) {
+					report.kept.push({ path, reason: 'changed' });
+					return;
+				}
+				const current = this.app.vault.getAbstractFileByPath(path);
+				if (!(current instanceof TFile)) {
+					report.kept.push({ path, reason: 'missing' });
+					return;
+				}
+				if (!sameStamp(stampOf(current), recheck.stamp) || guard.changed) {
+					report.kept.push({ path, reason: 'changed' });
+					return;
+				}
+				await this.app.fileManager.trashFile(current);
+				report.deleted.push(path);
+			} finally {
+				guard.stop();
 			}
-			// 复核里的哈希是最后一步异步操作；这里再核对一次文件身份，中间没有其他异步扫描
-			const current = this.app.vault.getAbstractFileByPath(path);
-			if (!(current instanceof TFile)) {
-				report.kept.push({ path, reason: 'missing' });
-				return;
-			}
-			if (!sameStamp(stampOf(current), recheck.stamp)) {
-				report.kept.push({ path, reason: 'changed' });
-				return;
-			}
-			await this.app.fileManager.trashFile(current);
-			report.deleted.push(path);
 		} catch (error) {
 			console.error(`CF ImageBed: cleanup of ${path} failed:`, error);
 			report.kept.push({ path, reason: 'error' });
 		}
 	}
 
+	private startChangeGuard(): ChangeGuard {
+		const subscriptions: { source: EventSource; ref: EventRef }[] = [];
+		let changed = false;
+		const mark = () => {
+			changed = true;
+		};
+		const listen = (source: EventSource, names: string[]) => {
+			for (const name of names) {
+				subscriptions.push({ source, ref: source.on(name, mark) });
+			}
+		};
+		listen(this.app.vault as unknown as EventSource, ['create', 'modify', 'delete', 'rename']);
+		listen(this.app.metadataCache as unknown as EventSource, ['changed', 'resolve']);
+		listen(this.app.workspace as unknown as EventSource, ['editor-change', 'layout-change', 'active-leaf-change']);
+		return {
+			get changed() {
+				return changed;
+			},
+			stop() {
+				for (const { source, ref } of subscriptions) {
+					source.offref(ref);
+				}
+			}
+		};
+	}
+
 	/**
 	 * 本地侧的全部前置条件。顺序：存在 → 引用（异步全库扫描）→ 打开的视图 → 哈希（最后，
-	 * 并核对哈希前后的 mtime/size），这样哈希到删除之间不再夹任何异步扫描。
+	 * 并核对哈希前后的 mtime/size）。最终阶段另有变化守卫兜底，见 cleanupOne。
 	 */
 	private async check(image: UploadedVaultImage): Promise<{ reason: KeepReason | null; stamp: FileStamp | null }> {
 		const settings = this.getSettings();
@@ -422,9 +473,14 @@ export function looksLikeImageBytes(buffer: ArrayBuffer | undefined): boolean {
 	if (ascii(0, 4) === 'GIF8') return true;
 	if (ascii(0, 4) === 'RIFF' && bytes.byteLength >= 12 && ascii(8, 4) === 'WEBP') return true;
 	if (ascii(0, 2) === 'BM') return true;
-	if (bytes.byteLength >= 12 && ascii(4, 4) === 'ftyp') return true;
-	const text = new TextDecoder().decode(bytes).trimStart().toLowerCase();
-	return text.startsWith('<svg') || text.startsWith('<?xml');
+	if (bytes.byteLength >= 12 && ascii(4, 4) === 'ftyp') {
+		// ISO-BMFF 容器也可能是 MP4/MOV：只接受图片品牌
+		const brand = ascii(8, 4).toLowerCase();
+		return ['avif', 'avis', 'heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand);
+	}
+	// SVG：前 1KB 内必须出现 <svg 标签；单纯的 XML 文档（如 S3 的 <Error> 响应）不算图片
+	const head = new TextDecoder().decode(new Uint8Array(buffer.slice(0, 1024))).toLowerCase();
+	return /<svg[\s>]/.test(head);
 }
 
 /** 文本（Markdown / Canvas / 视图数据）是否引用了该库内图片。 */
@@ -444,8 +500,12 @@ export function textReferencesImage(text: string, extension: string, file: TFile
  */
 export function mentionsLocalFile(text: string, fileName: string): boolean {
 	const stripped = text
-		.replace(/!?\[[^\]]*\]\(\s*<?https?:\/\/[^)]*\)/gi, ' ')
-		.replace(/<img\b[^>]*\bsrc\s*=\s*["']?https?:[^>]*>/gi, ' ')
+		// 只剔除「目标为远程 URL 的图片」整体：alt 是纯文本，上传后 alt 里仍是原文件名。
+		// alt 含 < 或 [ 的不剔除；普通链接 [text](http…) 一律不剔除——链接文本里可能嵌着本地 <img>。
+		.replace(/!\[[^\]<[]*\]\(\s*<?https?:\/\/[^)]*\)/gi, ' ')
+		// 只剔除 src 属性本身为远程的 <img>（\s 保证是独立的 src，不匹配 data-src 等）
+		.replace(/<img\b(?=[^>]*\ssrc\s*=\s*["']?https?:)[^>]*>/gi, ' ')
+		// 裸 URL 只剔除 URL 本身，不动它周围的链接文本或嵌套内容
 		.replace(/https?:\/\/[^\s)>"'\]]+/gi, ' ');
 	const normalized = safeDecodePercent(decodeHtmlEntities(stripped)).toLowerCase();
 	const needle = safeDecodePercent(decodeHtmlEntities(fileName)).toLowerCase();

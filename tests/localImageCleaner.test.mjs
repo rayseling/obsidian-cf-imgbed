@@ -62,9 +62,21 @@ function createSettings(overrides = {}) {
 	};
 }
 
+function createEventBus() {
+	const handlers = new Map(); // name -> Set<callback>
+	return {
+		on(name, callback) { if (!handlers.has(name)) handlers.set(name, new Set()); handlers.get(name).add(callback); return { name, callback }; },
+		offref(ref) { handlers.get(ref.name)?.delete(ref.callback); },
+		emit(name, ...args) { for (const callback of Array.from(handlers.get(name) ?? [])) callback(...args); },
+		count(name) { return handlers.get(name)?.size ?? 0; }
+	};
+}
+
 function createApp() {
 	const entries = new Map(); // path -> { file, bytes?, text? }
-	const resolveHandlers = new Set();
+	const vaultBus = createEventBus();
+	const metaBus = createEventBus();
+	const workspaceBus = createEventBus();
 	const app = {
 		trashed: [],
 		leaves: [],
@@ -80,21 +92,33 @@ function createApp() {
 			setText(p, text) { const entry = entries.get(p); entry.text = text; entry.file.stat.mtime++; },
 			getFiles: () => Array.from(entries.values()).map((entry) => entry.file),
 			getAbstractFileByPath: (p) => entries.get(p)?.file ?? null,
-			async readBinary(file) { return entries.get(file.path).bytes.buffer.slice(0); },
+			async readBinary(file) {
+				const bytes = entries.get(file.path).bytes.buffer.slice(0);
+				await app.onReadBinary?.(file);
+				return bytes;
+			},
 			async cachedRead(file) {
 				app.onCachedRead?.(file);
 				return entries.get(file.path).text ?? '';
-			}
+			},
+			on: (name, callback) => vaultBus.on(name, callback),
+			offref: (ref) => vaultBus.offref(ref),
+			emit: (name, ...args) => vaultBus.emit(name, ...args)
 		},
 		metadataCache: {
 			resolvedLinks: {},
-			on(name, callback) { assert.equal(name, 'resolve'); resolveHandlers.add(callback); return callback; },
-			offref(ref) { resolveHandlers.delete(ref); },
-			emitResolve(file) { for (const handler of Array.from(resolveHandlers)) handler(file); },
-			get listenerCount() { return resolveHandlers.size; }
+			on: (name, callback) => metaBus.on(name, callback),
+			offref: (ref) => metaBus.offref(ref),
+			emitResolve(file) { metaBus.emit('resolve', file); },
+			emit: (name, ...args) => metaBus.emit(name, ...args),
+			get listenerCount() { return metaBus.count('resolve') + metaBus.count('changed'); }
 		},
 		workspace: {
-			iterateAllLeaves(callback) { for (const leaf of app.leaves) callback(leaf); }
+			iterateAllLeaves(callback) { for (const leaf of app.leaves) callback(leaf); },
+			on: (name, callback) => workspaceBus.on(name, callback),
+			offref: (ref) => workspaceBus.offref(ref),
+			emit: (name, ...args) => workspaceBus.emit(name, ...args),
+			count: (name) => workspaceBus.count(name)
 		},
 		fileManager: {
 			async trashFile(file) { app.trashed.push(file.path); entries.delete(file.path); }
@@ -366,5 +390,71 @@ test('an image overwritten during the final reference scan is not deleted', asyn
 	assert.equal(overwritten, true, 'the overwrite must happen during the final scan');
 	assert.equal(report.deleted.length, 0);
 	assert.ok(['not-in-index', 'changed'].includes(report.kept[0].reason), report.kept[0].reason);
+	assert.ok(ctx.app.vault.getAbstractFileByPath('attachments/pic.png'));
+});
+
+test('a remote data-src or an outer remote link does not hide a local <img src>', async () => {
+	for (const html of [
+		'<img src="attachments/pic.png" data-src="https://example/remote.png">',
+		'[<img src="attachments/pic.png">](https://example/page)',
+		'[see ![[pic.png]] here](https://example/page)'
+	]) {
+		const ctx = await setup();
+		ctx.app.vault.addText('notes/html.md', html);
+		const report = await runAfterWriteBack(ctx);
+		assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'referenced' }], html);
+		assert.deepEqual(ctx.app.trashed, []);
+	}
+});
+
+test('remote verification rejects XML error documents and non-image ISO-BMFF files, accepts AVIF and SVG', async () => {
+	const bytes = (text) => Array.from(new TextEncoder().encode(text));
+	const cases = [
+		{ body: bytes('<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>'), contentType: 'application/xml', expectDeleted: false },
+		{ body: [0, 0, 0, 0x18, ...bytes('ftypisom'), 0, 0, 0, 0], contentType: '', expectDeleted: false },
+		{ body: [0, 0, 0, 0x18, ...bytes('ftypavif'), 0, 0, 0, 0], contentType: '', expectDeleted: true },
+		{ body: bytes('<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"></svg>'), contentType: '', expectDeleted: true }
+	];
+	for (const { body, contentType, expectDeleted } of cases) {
+		const ctx = await setup({ fetcher: createFetcher({ perMethod: { HEAD: { status: 404, contentType: '' }, GET: { contentType, body } } }) });
+		const report = await runAfterWriteBack(ctx);
+		assert.equal(report.deleted.length === 1, expectDeleted, JSON.stringify({ contentType, expectDeleted, report }));
+	}
+});
+
+test('a reference added in an editor while the final hash is being computed aborts the deletion', async () => {
+	const ctx = await setup();
+	let reads = 0;
+	ctx.app.onReadBinary = async () => {
+		reads++;
+		if (reads === 2) {
+			// 最终阶段读取图片字节期间，另一编辑器新增了 ![[pic.png]]
+			ctx.app.leaves = [{ view: new MarkdownView('draft ![[pic.png]]') }];
+			ctx.app.workspace.emit('editor-change');
+		}
+	};
+	const report = await runAfterWriteBack(ctx);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'changed' }]);
+	assert.deepEqual(ctx.app.trashed, []);
+	assert.equal(ctx.app.workspace.count('editor-change'), 0, 'guard listeners must be removed');
+});
+
+test('a same-size, same-mtime replacement after the final hash is caught by the change guard', async () => {
+	const ctx = await setup();
+	let reads = 0;
+	ctx.app.onReadBinary = async () => {
+		reads++;
+		if (reads === 2) {
+			// 哈希读完之后、删除之前：同路径换成未上传的新内容，大小与 mtime 完全相同
+			const entry = ctx.app.vault.getAbstractFileByPath('attachments/pic.png');
+			const stamp = { ...entry.stat };
+			ctx.app.vault.addBinary('attachments/pic.png', [9, 9, 9, 9]);
+			entry.stat.mtime = stamp.mtime;
+			entry.stat.size = stamp.size;
+			ctx.app.vault.emit('modify', entry);
+		}
+	};
+	const report = await runAfterWriteBack(ctx);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'changed' }]);
 	assert.ok(ctx.app.vault.getAbstractFileByPath('attachments/pic.png'));
 });
