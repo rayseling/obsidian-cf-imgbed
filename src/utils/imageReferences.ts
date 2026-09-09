@@ -45,22 +45,60 @@ export function computeExcludedRanges(content: string): ExcludedRange[] {
 	const plainSegments: ExcludedRange[] = [];
 	let segmentStart = 0;
 
+	let indented: { start: number; lastContentEnd: number } | null = null;
+	let previousBlank = true;
+
 	for (const line of lines) {
 		const lineStart = offset;
 		offset += line.length + 1;
-		const fenceMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+		const lineEnd = Math.min(offset, content.length);
+		const blank = line.trim().length === 0;
+
 		if (fence) {
-			if (fenceMatch && fenceMatch[1][0] === fence.char && fenceMatch[1].length >= fence.length) {
-				ranges.push({ start: fence.start, end: Math.min(offset, content.length) });
+			// 结束围栏：同种字符、长度不小于开头，且后面不能有 info string（```lang 只能是开头）
+			const closeMatch = line.match(/^\s{0,3}(`{3,}|~{3,})\s*$/);
+			if (closeMatch && closeMatch[1][0] === fence.char && closeMatch[1].length >= fence.length) {
+				ranges.push({ start: fence.start, end: lineEnd });
 				fence = null;
-				segmentStart = Math.min(offset, content.length);
+				segmentStart = lineEnd;
 			}
+			previousBlank = false;
 			continue;
 		}
-		if (fenceMatch) {
-			plainSegments.push({ start: segmentStart, end: lineStart });
-			fence = { char: fenceMatch[1][0], length: fenceMatch[1].length, start: lineStart };
+
+		// 缩进代码块：前一行为空（或文档开头），本行缩进 ≥4 空格或一个 Tab；空行不打断，首个非缩进行结束
+		const isIndentedLine = /^( {4,}|\t)/.test(line) && !blank;
+		if (indented) {
+			if (isIndentedLine) {
+				indented.lastContentEnd = lineEnd;
+				continue;
+			}
+			if (blank) {
+				continue;
+			}
+			ranges.push({ start: indented.start, end: indented.lastContentEnd });
+			plainSegments.push({ start: segmentStart, end: indented.start });
+			segmentStart = indented.lastContentEnd;
+			indented = null;
 		}
+		if (isIndentedLine && previousBlank) {
+			indented = { start: lineStart, lastContentEnd: lineEnd };
+			previousBlank = false;
+			continue;
+		}
+
+		const openMatch = line.match(/^\s{0,3}(`{3,}|~{3,})/);
+		if (openMatch) {
+			plainSegments.push({ start: segmentStart, end: lineStart });
+			fence = { char: openMatch[1][0], length: openMatch[1].length, start: lineStart };
+		}
+		previousBlank = blank;
+	}
+
+	if (indented) {
+		ranges.push({ start: indented.start, end: indented.lastContentEnd });
+		plainSegments.push({ start: segmentStart, end: indented.start });
+		segmentStart = indented.lastContentEnd;
 	}
 
 	if (fence) {
