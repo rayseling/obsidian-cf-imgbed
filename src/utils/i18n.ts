@@ -263,6 +263,7 @@ const translations: Record<Language, Translations> = {
 				referenced: '仍被其他笔记/Canvas 引用',
 				'unsaved-edit': '打开的编辑器中仍有引用',
 				'remote-unverified': '远端链接验证失败',
+				cancelled: '功能已关闭或插件已卸载，已中止',
 				error: '处理出错'
 			},
 			orphanConfirmTitle: '清理已上云的孤立图片',
@@ -592,6 +593,7 @@ const translations: Record<Language, Translations> = {
 				referenced: 'still referenced by a note/Canvas',
 				'unsaved-edit': 'still referenced in an open editor',
 				'remote-unverified': 'remote link could not be verified',
+				cancelled: 'feature turned off or plugin unloaded, aborted',
 				error: 'error while processing'
 			},
 			orphanConfirmTitle: 'Clean up uploaded orphan images',
