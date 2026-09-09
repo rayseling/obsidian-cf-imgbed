@@ -11,8 +11,19 @@ export interface UploadIndexEntry {
 }
 
 interface PersistedUploadIndex {
-	version: 1;
+	/** 1 = 命名空间只含 origin（旧版）；2 = origin + 路径。 */
+	version: 1 | 2;
 	entries: Record<string, UploadIndexEntry>;
+}
+
+export const UPLOAD_INDEX_VERSION = 2;
+
+export interface UploadIndexLoadOptions {
+	/**
+	 * 是否接受 v1（只按 origin 命名空间）的旧记录。仅当当前 API URL 没有路径部分时两种键完全一致，
+	 * 才能安全沿用；否则旧记录可能跨目标误命中，应丢弃（代价只是多传一次）。
+	 */
+	acceptLegacyV1: boolean;
 }
 
 /** 索引持久化所需的最小适配器接口（对应 Obsidian 的 DataAdapter）。 */
@@ -40,7 +51,7 @@ export class UploadIndex {
 		private filePath: string
 	) {}
 
-	async load(): Promise<void> {
+	async load(options: UploadIndexLoadOptions = { acceptLegacyV1: false }): Promise<void> {
 		this.entries.clear();
 		try {
 			if (!(await this.storage.exists(this.filePath))) {
@@ -48,14 +59,24 @@ export class UploadIndex {
 			}
 			const raw = await this.storage.read(this.filePath);
 			const parsed = JSON.parse(raw) as Partial<PersistedUploadIndex> | null;
-			if (!parsed || parsed.version !== 1 || typeof parsed.entries !== 'object' || parsed.entries === null) {
+			if (!parsed || typeof parsed.entries !== 'object' || parsed.entries === null
+				|| (parsed.version !== 1 && parsed.version !== UPLOAD_INDEX_VERSION)) {
 				console.warn('CF ImageBed: upload index has an unknown format and was ignored');
+				return;
+			}
+			if (parsed.version === 1 && !options.acceptLegacyV1) {
+				console.warn('CF ImageBed: legacy (v1) upload index cannot be mapped onto the current API path and was discarded');
+				this.dirty = true;
+				void this.scheduleSave();
 				return;
 			}
 			for (const [key, entry] of Object.entries(parsed.entries)) {
 				if (isValidEntry(entry)) {
 					this.entries.set(key, entry);
 				}
+			}
+			if (parsed.version === 1) {
+				void this.scheduleSave(); // 升级为 v2 格式
 			}
 		} catch (error) {
 			console.warn('CF ImageBed: failed to load upload index, starting empty', error);
@@ -137,7 +158,7 @@ export class UploadIndex {
 		}
 		this.dirty = false;
 		const payload: PersistedUploadIndex = {
-			version: 1,
+			version: UPLOAD_INDEX_VERSION,
 			entries: Object.fromEntries(this.entries)
 		};
 		await this.storage.write(this.filePath, JSON.stringify(payload, null, 2));
@@ -170,7 +191,8 @@ export function buildUploadNamespace(settings: Pick<CFImageBedSettings, 'apiUrl'
 	try {
 		// origin + 路径：同一域名下的不同部署（/imgbed-a、/imgbed-b）是不同图床，不能互相复用
 		const parsed = new URL(apiUrl);
-		target = `${parsed.origin}${parsed.pathname}`.toLowerCase().replace(/\/+$/, '');
+		// 主机名不区分大小写，路径区分（/A 与 /a 可能是两个部署）
+		target = `${parsed.origin.toLowerCase()}${parsed.pathname.replace(/\/+$/, '')}`;
 	} catch {
 		// 非标准 URL 时退回到去掉尾部斜杠的原文
 	}

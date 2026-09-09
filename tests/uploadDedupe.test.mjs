@@ -212,7 +212,7 @@ test('index writes are serialized and the final file reflects every entry', asyn
 	await index.flush();
 
 	const persisted = JSON.parse(storage.files.get('idx.json'));
-	assert.equal(persisted.version, 1);
+	assert.equal(persisted.version, 2);
 	assert.equal(Object.keys(persisted.entries).length, 20);
 	assert.ok(storage.writes < 20, `expected coalesced writes, got ${storage.writes}`);
 
@@ -294,6 +294,43 @@ test('changing the target image bed while an upload is in flight does not record
 	const { service, index } = await createService(settings);
 	const outcome = await service.uploadImageDetailed(png([8, 8]));
 	assert.equal(outcome.src, '/file/moved.png');
-	assert.equal(index.size, 0, 'result must not be indexed under the old namespace');
+	// 快照：请求、返回链接、索引键都来自上传开始时的设置
+	assert.equal(outcome.url, 'http://img.example:7658/file/moved.png', 'url must use the image bed the request was sent to');
+	assert.equal(index.size, 1);
+	assert.equal(index.findBySrc('/file/moved.png')?.key.includes('img.example:7658'), true);
 	assert.equal(calls, 1);
+
+	// 快照之后的上传才使用新图床
+	const next = await service.uploadImageDetailed(png([8, 9]));
+	assert.equal(next.url, 'http://other.example/file/moved.png');
+});
+
+test('namespace keeps path case but folds host case', () => {
+	assert.notEqual(
+		buildUploadNamespace(createSettings({ apiUrl: 'https://host.example/A' })),
+		buildUploadNamespace(createSettings({ apiUrl: 'https://host.example/a' }))
+	);
+	assert.equal(
+		buildUploadNamespace(createSettings({ apiUrl: 'https://HOST.example/A/' })),
+		buildUploadNamespace(createSettings({ apiUrl: 'https://host.example/A' }))
+	);
+});
+
+test('a legacy v1 index is kept only when the current API URL has no path, and is rewritten as v2', async () => {
+	const v1 = JSON.stringify({ version: 1, entries: { 'h|https://host.example|cfr2||wm:off;cmp:off;srv:off': { src: '/file/old.png', name: 'o', size: 1, uploadedAt: 1 } } });
+
+	const compatible = createStorage({ 'idx.json': v1 });
+	const keep = new UploadIndex(compatible, 'idx.json');
+	await keep.load({ acceptLegacyV1: true });
+	await keep.flush();
+	assert.equal(keep.size, 1);
+	assert.equal(JSON.parse(compatible.files.get('idx.json')).version, 2);
+
+	const incompatible = createStorage({ 'idx.json': v1 });
+	const drop = new UploadIndex(incompatible, 'idx.json');
+	await drop.load({ acceptLegacyV1: false });
+	await drop.flush();
+	assert.equal(drop.size, 0);
+	assert.equal(JSON.parse(incompatible.files.get('idx.json')).version, 2);
+	assert.deepEqual(JSON.parse(incompatible.files.get('idx.json')).entries, {});
 });
