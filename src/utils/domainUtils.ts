@@ -1,15 +1,28 @@
 export function getEffectiveExcludedDomains(
 	apiUrl: string,
-	configuredDomains: string[]
+	configuredDomains: string[],
+	customReturnBaseUrl = ''
 ): string[] {
 	const domains = [...configuredDomains];
-	const apiHostname = extractHostname(apiUrl);
 
-	if (apiHostname) {
-		domains.push(apiHostname);
+	// API 域名与自定义返回链接域名都是「自己的图床」，其图片不应再次转存。
+	for (const hostname of getOwnImageBedHostnames(apiUrl, customReturnBaseUrl)) {
+		domains.push(hostname);
 	}
 
 	return uniqueNormalizedDomains(domains);
+}
+
+/** 返回当前图床自身的域名（API URL + 自定义返回链接前缀），去重后按顺序给出。 */
+export function getOwnImageBedHostnames(apiUrl: string, customReturnBaseUrl = ''): string[] {
+	const hostnames: string[] = [];
+	for (const candidate of [apiUrl, customReturnBaseUrl]) {
+		const hostname = extractHostname(candidate ?? '');
+		if (hostname && !hostnames.includes(hostname)) {
+			hostnames.push(hostname);
+		}
+	}
+	return hostnames;
 }
 
 export function parseDomainList(value: string): string[] {

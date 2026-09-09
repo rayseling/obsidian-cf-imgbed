@@ -33,8 +33,8 @@ export class EventHandlers {
 					// 阻止默认的拖拽行为，防止 Obsidian 创建本地文件
 					evt.preventDefault();
 					evt.stopPropagation();
-					// 上传图片
-					void this.imageHandler.uploadImageFromFile(imageFiles[0]);
+					// 上传全部拖入的图片；目标编辑器在开始时一次性捕获，避免上传期间切换笔记后插错位置
+					void this.imageHandler.uploadImageFilesToEditor(imageFiles);
 					return;
 				}
 			}

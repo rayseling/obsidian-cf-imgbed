@@ -2,7 +2,7 @@ import { App, DropdownComponent, PluginSettingTab, Setting, SliderComponent, Tex
 import CFImageBedPlugin from '../../main';
 import { I18n, resolveLanguage } from '../utils/i18n';
 import { UploadChannel, UPLOAD_CHANNELS, Language, LANGUAGES } from '../types';
-import { extractHostname, formatDomainList, parseDomainList } from '../utils/domainUtils';
+import { formatDomainList, getOwnImageBedHostnames, parseDomainList } from '../utils/domainUtils';
 
 export class CFImageBedSettingTab extends PluginSettingTab {
 	plugin: CFImageBedPlugin;
@@ -479,9 +479,12 @@ export class CFImageBedSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
-		const autoExcludedDomain = extractHostname(this.plugin.settings.apiUrl);
-		const excludedDescSuffix = autoExcludedDomain
-			? `\n${this.i18n.getLanguage() === 'zh' ? '当前自动排除：' : 'Auto excluded:'} ${autoExcludedDomain}`
+		const autoExcludedDomains = getOwnImageBedHostnames(
+			this.plugin.settings.apiUrl,
+			this.plugin.settings.customReturnBaseUrl
+		);
+		const excludedDescSuffix = autoExcludedDomains.length > 0
+			? `\n${this.i18n.getLanguage() === 'zh' ? '当前自动排除：' : 'Auto excluded:'} ${autoExcludedDomains.join(', ')}`
 			: '';
 
 		new Setting(container)

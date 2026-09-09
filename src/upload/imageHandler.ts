@@ -28,8 +28,23 @@ export class ImageHandler {
 
 	async uploadImageFromFile(file: File, deleteLocal = false): Promise<void> {
 		void deleteLocal;
-		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-		await this.uploadImageToEditor(file, activeView?.editor);
+		await this.uploadImageFilesToEditor([file]);
+	}
+
+	/**
+	 * 依次上传多张图片并插入编辑器。目标编辑器与所属笔记在开始时一次性捕获，
+	 * 后续图片不再重新读取「当前活动笔记」，用户中途切换笔记也不会插错位置。
+	 */
+	async uploadImageFilesToEditor(files: File[], editor?: Editor): Promise<void> {
+		const targetEditor = editor ?? this.app.workspace.getActiveViewOfType(MarkdownView)?.editor;
+		if (!targetEditor) {
+			new Notice(this.i18n?.t('notices.openMarkdownFileFirst') || 'Please open a Markdown file first');
+			return;
+		}
+		const noteFile = this.app.workspace.getActiveFile();
+		for (const file of files) {
+			await this.uploadImageToEditor(file, targetEditor, noteFile);
+		}
 	}
 
 	private getInputFileFromEvent(event: Event): File | null {
@@ -336,13 +351,13 @@ export class ImageHandler {
 		document.body.appendChild(modal);
 	}
 
-	private async uploadImageToEditor(file: File, editor?: Editor): Promise<void> {
+	private async uploadImageToEditor(file: File, editor?: Editor, capturedNoteFile?: TFile | null): Promise<void> {
 		const targetEditor = editor ?? this.app.workspace.getActiveViewOfType(MarkdownView)?.editor;
 		if (!targetEditor) {
 			new Notice(this.i18n?.t('notices.openMarkdownFileFirst') || 'Please open a Markdown file first');
 			return;
 		}
-		const noteFile = this.app.workspace.getActiveFile();
+		const noteFile = capturedNoteFile !== undefined ? capturedNoteFile : this.app.workspace.getActiveFile();
 
 		const settings = this.getSettings?.();
 		if (settings?.showUploadProgress) {
@@ -897,7 +912,8 @@ export class ImageHandler {
 	private getExcludedDomains(settings?: CFImageBedSettings): string[] {
 		return getEffectiveExcludedDomains(
 			settings?.apiUrl ?? '',
-			settings?.excludedImageDomains ?? []
+			settings?.excludedImageDomains ?? [],
+			settings?.customReturnBaseUrl ?? ''
 		);
 	}
 
