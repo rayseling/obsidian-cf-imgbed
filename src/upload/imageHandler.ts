@@ -14,6 +14,7 @@ import { getEffectiveExcludedDomains, isUrlExcluded } from '../utils/domainUtils
 import { LocalImageCleaner, UploadedVaultImage } from './localImageCleaner';
 import { isAutoUploadActiveFor } from '../utils/autoUploadScope';
 import { sniffImageMimeType } from '../utils/imageSniffer';
+import { classifyRemoteHost } from '../utils/networkGuard';
 
 /** 异步上传的落点：发起时插入的占位符，完成后只替换它。 */
 interface PendingInsertion {
@@ -997,6 +998,10 @@ export class ImageHandler {
 	}
 
 	private async fetchRemoteImageFile(url: string, altText: string): Promise<File> {
+		// 调用方已按同一规则过滤；这里是最后一道闸，任何新入口都绕不过去
+		if (!this.isFetchableRemoteHost(url)) {
+			throw new Error('拒绝请求本机 / 内网地址');
+		}
 		// 部分图床/CDN 启用了 Referer 防盗链，直接请求会返回 403。
 		// 带上「图片自身来源站」的 Referer + 浏览器 UA，可绕过绝大多数同域防盗链。
 		const requestHeaders: Record<string, string> = {
@@ -1234,7 +1239,16 @@ export class ImageHandler {
 		);
 	}
 
+	/** 不转存的远程地址：排除域名（含自己的图床），以及默认情况下的本机 / 内网 / 链路本地地址。 */
 	private isExcludedRemoteUrl(url: string, domains: string[]): boolean {
-		return isUrlExcluded(url, domains);
+		return isUrlExcluded(url, domains) || !this.isFetchableRemoteHost(url);
+	}
+
+	private isFetchableRemoteHost(url: string): boolean {
+		const kind = classifyRemoteHost(url);
+		if (kind === 'private') {
+			return Boolean(this.getSettings?.()?.allowPrivateNetworkImageFetch);
+		}
+		return kind === 'public';
 	}
 }

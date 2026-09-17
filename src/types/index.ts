@@ -33,6 +33,8 @@ export interface CFImageBedSettings {
 	compressThreshold: number; // MB - 压缩阈值
 	targetSize: number; // MB - 期望大小
 	enableNetworkImageUpload: boolean;
+	/** 网络图片转存是否允许请求本机 / 内网 / 链路本地地址。默认关闭。 */
+	allowPrivateNetworkImageFetch: boolean;
 	enableExcalidrawUpload: boolean;
 	excludedImageDomains: string[];
 
@@ -94,6 +96,7 @@ export const DEFAULT_SETTINGS: CFImageBedSettings = {
 	compressThreshold: 2, // 2MB
 	targetSize: 1, // 1MB
 	enableNetworkImageUpload: false,
+	allowPrivateNetworkImageFetch: false,
 	enableExcalidrawUpload: true,
 	excludedImageDomains: [],
 

@@ -150,7 +150,11 @@ const translations: Record<Language, Translations> = {
 				},
 				enableNetworkImageUpload: {
 					name: '启用网络图片上传',
-					desc: '开启后，粘贴外链图片或执行“上传当前文档所有图片”命令时，会先抓取外链并上传到自己的图床；失败时保持原链接'
+					desc: '开启后，粘贴外链图片或执行“上传当前文档所有图片”命令时，会先抓取外链并上传到自己的图床；失败时保持原链接。抓取时会带上浏览器 User-Agent 和图片所在站点的 Referer，以通过常见的防盗链'
+				},
+				allowPrivateNetworkImageFetch: {
+					name: '允许转存本机 / 内网地址的图片',
+					desc: '默认关闭：笔记里指向 localhost、192.168.x.x、10.x.x.x、*.local 等地址的图片不会被抓取。笔记内容可能来自网页剪藏或共享库，开启后这些内容可以让插件请求你的内网服务并把图片转存到图床。自己的图床域名始终不转存，不受此开关影响'
 				},
 				enableExcalidrawUpload: {
 					name: '接管 Excalidraw 图片上传',
@@ -481,7 +485,11 @@ const translations: Record<Language, Translations> = {
 				},
 				enableNetworkImageUpload: {
 					name: 'Enable remote image upload',
-					desc: 'When enabled, pasted remote image links and the “upload current note images” command will fetch remote images and upload them to your image bed. Failed uploads keep the original link.'
+					desc: 'When enabled, pasted remote image links and the “upload current note images” command will fetch remote images and upload them to your image bed. Failed uploads keep the original link. Requests send a browser User-Agent and the image site as Referer to pass common hotlink protection.'
+				},
+				allowPrivateNetworkImageFetch: {
+					name: 'Allow fetching images from local / private network addresses',
+					desc: 'Off by default: images pointing at localhost, 192.168.x.x, 10.x.x.x, *.local and similar addresses are not fetched. Note content can come from web clippers or shared vaults; enabling this lets such content make the plugin request services on your network and copy the images to your image bed. Your own image bed host is never re-uploaded regardless of this switch.'
 				},
 				enableExcalidrawUpload: {
 					name: 'Handle Excalidraw image uploads',

@@ -489,6 +489,16 @@ export class CFImageBedSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(container)
+			.setName(this.i18n.t('settings.advanced.allowPrivateNetworkImageFetch.name'))
+			.setDesc(this.i18n.t('settings.advanced.allowPrivateNetworkImageFetch.desc'))
+			.addToggle((toggle: ToggleComponent) => toggle
+				.setValue(this.plugin.settings.allowPrivateNetworkImageFetch ?? false)
+				.onChange(async (value: boolean) => {
+					this.plugin.settings.allowPrivateNetworkImageFetch = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(container)
 			.setName(this.i18n.t('settings.advanced.enableExcalidrawUpload.name'))
 			.setDesc(this.i18n.t('settings.advanced.enableExcalidrawUpload.desc'))
 			.addToggle((toggle: ToggleComponent) => toggle

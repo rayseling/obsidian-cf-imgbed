@@ -31,7 +31,7 @@ after(() => rm(buildDir, { recursive: true, force: true }));
 const outfile = path.join(buildDir, 'bundle.mjs');
 await build({
 	stdin: {
-		contents: "export { ImageHandler } from './src/upload/imageHandler.ts'; export { sniffImageMimeType } from './src/utils/imageSniffer.ts'; export { TFile } from 'obsidian';",
+		contents: "export { ImageHandler } from './src/upload/imageHandler.ts'; export { sniffImageMimeType } from './src/utils/imageSniffer.ts'; export { classifyRemoteHost } from './src/utils/networkGuard.ts'; export { TFile } from 'obsidian';",
 		resolveDir: process.cwd(),
 		loader: 'js'
 	},
@@ -42,7 +42,7 @@ await build({
 	outfile,
 	plugins: [stubObsidian]
 });
-const { ImageHandler, sniffImageMimeType, TFile } = await import(pathToFileURL(outfile).href);
+const { ImageHandler, sniffImageMimeType, classifyRemoteHost, TFile } = await import(pathToFileURL(outfile).href);
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
 const bytes = (text) => new TextEncoder().encode(text);
@@ -66,7 +66,7 @@ test('sniffer rejects HTML, JSON, video containers and empty bodies', () => {
 	assert.equal(sniffImageMimeType(new ArrayBuffer(0)), null);
 });
 
-function createHandler() {
+function createHandler(settings = {}) {
 	const uploadService = {
 		uploads: [],
 		async uploadImage(file) {
@@ -82,13 +82,14 @@ function createHandler() {
 	const handler = new ImageHandler(app, uploadService, () => ({
 		apiUrl: 'https://img.example',
 		excludedImageDomains: [],
-		enableNetworkImageUpload: true
+		enableNetworkImageUpload: true,
+		...settings
 	}));
 	return { handler, uploadService };
 }
 
 test('an intranet page answering 200 text/html is never wrapped as a PNG and uploaded', async () => {
-	const { handler, uploadService } = createHandler();
+	const { handler, uploadService } = createHandler({ allowPrivateNetworkImageFetch: true });
 	globalThis.__requestUrl = async () => ({
 		status: 200,
 		headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -129,4 +130,48 @@ test('a real image without a usable content-type is still uploaded with the snif
 	const result = await handler.uploadImagesInText('![pic](https://site.example/download?id=1)', note, note.path);
 	assert.equal(result.success, 1);
 	assert.deepEqual(uploadService.uploads, [{ name: 'pic.png', type: 'image/png' }]);
+});
+
+test('hosts are classified as public or private, including the usual disguises', () => {
+	for (const url of [
+		'http://localhost:8080/a.png', 'http://127.0.0.1/a.png', 'http://2130706433/a.png', 'http://0x7f.1/a.png',
+		'http://0.0.0.0/a.png', 'http://10.1.2.3/a.png', 'http://172.16.0.9/a.png', 'http://192.168.2.191:7658/a.png',
+		'http://169.254.169.254/latest/meta-data', 'http://100.64.0.1/a.png', 'http://[::1]/a.png', 'http://[fe80::1]/a.png',
+		'http://[fd12:3456::1]/a.png', 'http://[::ffff:192.168.1.1]/a.png', 'http://router.local/a.png', 'http://nas/a.png',
+		'http://printer.lan/a.png'
+	]) {
+		assert.equal(classifyRemoteHost(url), 'private', url);
+	}
+	for (const url of ['https://example.com/a.png', 'http://8.8.8.8/a.png', 'http://172.32.0.1/a.png', 'https://[2606:4700::1111]/a.png']) {
+		assert.equal(classifyRemoteHost(url), 'public', url);
+	}
+	for (const url of ['ftp://example.com/a.png', 'file:///etc/hosts', 'not a url']) {
+		assert.equal(classifyRemoteHost(url), 'invalid', url);
+	}
+});
+
+test('by default images on loopback / private addresses are skipped without any request being made', async () => {
+	const { handler, uploadService } = createHandler();
+	let requests = 0;
+	globalThis.__requestUrl = async () => { requests++; return { status: 200, headers: { 'content-type': 'image/png' }, arrayBuffer: buffer(PNG) }; };
+	const note = new TFile('notes/a.md');
+	const content = '![cam](http://192.168.1.10:8081/snapshot.jpg)\n![admin](http://127.0.0.1:8080/logo.png)\n![r](http://router.local/x.png)';
+
+	const result = await handler.uploadImagesInText(content, note, note.path);
+
+	assert.equal(requests, 0);
+	assert.equal(result.success, 0);
+	assert.equal(result.failed, 0, 'skipped, not failed: auto-upload must not retry these');
+	assert.equal(result.content, content);
+	assert.deepEqual(uploadService.uploads, []);
+	assert.equal(handler.countUploadableImages(content), 0);
+});
+
+test('private addresses are fetched once the user explicitly allows them', async () => {
+	const { handler, uploadService } = createHandler({ allowPrivateNetworkImageFetch: true });
+	globalThis.__requestUrl = async () => ({ status: 200, headers: { 'content-type': 'image/png' }, arrayBuffer: buffer(PNG) });
+	const note = new TFile('notes/a.md');
+	const result = await handler.uploadImagesInText('![nas](http://192.168.2.50/photo.png)', note, note.path);
+	assert.equal(result.success, 1);
+	assert.equal(uploadService.uploads.length, 1);
 });
