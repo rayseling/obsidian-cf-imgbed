@@ -606,3 +606,54 @@ test('the text cache does not survive between cleanup runs', async () => {
 	assert.deepEqual(await ctx.cleaner.findOrphans(), []);
 	assert.equal(ctx.app.vault.listenerCount?.('modify') ?? 0, 0);
 });
+
+test('references from non-Markdown text files (.excalidraw, .base, .html, .txt, .css, unknown) block deletion', async () => {
+	for (const [refPath, text] of [
+		['drawings/old.excalidraw', '{"files":{"abc":{"name":"attachments/pic.png"}}}'],
+		['views/gallery.base', 'views:\n  - image: attachments/pic.png'],
+		['export/page.html', '<img src="../attachments/pic.png">'],
+		['notes/plain.txt', 'see pic.png'],
+		['styles/theme.css', '.banner { background: url("attachments/pic.png"); }'],
+		['data/custom.xyz', 'cover = pic.png']
+	]) {
+		const ctx = await setup();
+		ctx.app.vault.addText(refPath, text);
+		const report = await runAfterWriteBack(ctx);
+		assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'referenced' }], refPath);
+		assert.deepEqual(ctx.app.trashed, [], refPath);
+		assert.deepEqual(await ctx.cleaner.findOrphans(), [], refPath);
+	}
+});
+
+test('a text file that cannot be read is treated as a reference (fail-safe)', async () => {
+	const ctx = await setup();
+	ctx.app.vault.addText('notes/locked.txt', 'unrelated');
+	const cachedRead = ctx.app.vault.cachedRead;
+	ctx.app.vault.cachedRead = async (file) => {
+		if (file.path === 'notes/locked.txt') {
+			throw new Error('EACCES');
+		}
+		return cachedRead(file);
+	};
+	const report = await runAfterWriteBack(ctx);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'referenced' }]);
+	assert.deepEqual(ctx.app.trashed, []);
+});
+
+test('known binary files are not scanned, and an SVG mentioning its own name is not its own reference', async () => {
+	const ctx = await setup();
+	let reads = [];
+	ctx.app.onCachedRead = (file) => reads.push(file.path);
+	ctx.app.vault.addText('docs/manual.pdf', 'pic.png');
+	const report = await runAfterWriteBack(ctx);
+	assert.deepEqual(report.deleted, ['attachments/pic.png']);
+	assert.ok(!reads.includes('docs/manual.pdf'));
+
+	const svgCtx = await setup();
+	const bytes = Array.from(new TextEncoder().encode('<svg><title>logo.svg</title></svg>'));
+	const svg = svgCtx.app.vault.addBinary('attachments/logo.svg', bytes);
+	svgCtx.app.vault.cachedRead = async (file) => (file.path === svg.path ? '<svg><title>logo.svg</title></svg>' : '');
+	await indexImage(svgCtx.index, svgCtx.settings, bytes, '/file/logo.svg');
+	const orphans = await svgCtx.cleaner.findOrphans();
+	assert.ok(orphans.some((item) => item.file.path === 'attachments/logo.svg'));
+});

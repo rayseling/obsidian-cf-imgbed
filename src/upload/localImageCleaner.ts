@@ -6,6 +6,31 @@ import { UploadIndex, buildProcessingPolicy, buildUploadIndexKey, buildUploadNam
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif', 'apng', 'heic', 'heif', 'ico']);
 
+/**
+ * 已知的二进制格式：不可能以文本形式引用库内图片，引用扫描时跳过。
+ * 其余一律当文本扫描（.excalidraw / .base / .html / .txt / .css / .json / .svg / 未知扩展名…）——
+ * 引用扫描是「上传后删除」唯一的不可逆路径，宁可多扫，不能只认 .md / .canvas。
+ */
+const BINARY_EXTENSIONS = new Set([
+	'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'avif', 'apng', 'heic', 'heif', 'ico', 'tif', 'tiff', 'psd',
+	'mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', '3gp', 'mp4', 'mov', 'mkv', 'webm', 'avi', 'ogv',
+	'pdf', 'zip', 'gz', 'tar', '7z', 'rar', 'dmg', 'exe', 'bin', 'dll', 'so', 'wasm',
+	'ttf', 'otf', 'woff', 'woff2', 'eot',
+	'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'epub', 'sqlite', 'db'
+]);
+
+function isScannableTextFile(file: TFile): boolean {
+	return !BINARY_EXTENSIONS.has(file.extension.toLowerCase());
+}
+
+/** 一份文本为引用搜索预处理后的形态；同一批清理里每个文件只预处理一次，之后每张图只做子串查找。 */
+interface PreparedText {
+	/** Canvas：file 节点引用的库内路径；解析失败时 unparsable 为 true（按「有引用」处理）。 */
+	canvasFiles: Set<string> | null;
+	unparsable: boolean;
+	haystacks: string[];
+}
+
 /** 一张已成功上传、且来自库内文件的图片。 */
 export interface UploadedVaultImage {
 	file: TFile;
@@ -62,7 +87,8 @@ interface FileStamp {
  * 上传成功后的本地图片清理。图床即将成为唯一副本，因此删除前逐项核对，任何一项不满足都保留原图：
  *
  *  1. 等待源笔记的链接解析完成（resolve 事件，写回前已注册；超时保留）。
- *  2. 全库引用检查：resolvedLinks + 所有 .canvas（解析失败视为有引用）+ 全文按文件名搜索
+ *  2. 全库引用检查：resolvedLinks + 所有 .canvas（解析失败视为有引用）+ 全库所有文本类文件（不只 .md：
+ *     .excalidraw / .base / .html / .txt / .css / 未知扩展名…；读不出来视为有引用）按文件名搜索
  *     （先剔除指向远程 URL 的图片/链接/<img> 结构和裸 URL，再做 HTML 实体与百分号解码，
  *     覆盖 `pic%201.png`、`&amp;` 这类写法）+ 所有打开视图中的内容（Markdown 编辑器、
  *     可读取 getViewData 的 Canvas/Excalidraw 等文本视图；无法读取内容的文件视图一律视为有引用）。
@@ -82,7 +108,7 @@ interface FileStamp {
 export class LocalImageCleaner {
 	static resolveTimeoutMs = 15000;
 
-	private textCache = new Map<string, { mtime: number; size: number; text: string }>();
+	private textCache = new Map<string, { mtime: number; size: number; prepared: PreparedText }>();
 	/** 正在进行的清理批次数；>0 时订阅库事件让 textCache 失效，见 withFreshTextCache。 */
 	private activeRuns = 0;
 	private stopCacheInvalidation: (() => void) | null = null;
@@ -397,8 +423,9 @@ export class LocalImageCleaner {
 			}
 		}
 
-		for (const { file: other, text } of await this.getVaultTexts()) {
-			if (textReferencesImage(text, other.extension, file)) {
+		for (const { file: other, prepared } of await this.getVaultTexts()) {
+			// 图片自己（如 .svg）里出现自己的文件名不算引用
+			if (other.path !== file.path && preparedReferences(prepared, file)) {
 				return true;
 			}
 		}
@@ -444,8 +471,8 @@ export class LocalImageCleaner {
 					referenced = textReferencesImage(view.getViewData(), ext, file);
 					return;
 				}
-				if (viewFile && (viewFile.extension === 'md' || viewFile.extension === 'canvas')) {
-					referenced = true; // 内容无法确认的笔记/画布视图
+				if (viewFile && isScannableTextFile(viewFile)) {
+					referenced = true; // 内容无法确认的文本类视图（笔记、画布、.base、旧版 .excalidraw…）
 				}
 			} catch {
 				referenced = true;
@@ -455,27 +482,34 @@ export class LocalImageCleaner {
 	}
 
 	/**
-	 * 全库 Markdown + Canvas 文本：同一批清理里多张图共享一次读取；文件事件或 mtime/size 变化
-	 * 都会让对应条目失效并重读（见 withFreshTextCache），不会误用过期内容。
+	 * 全库所有文本类文件（不只 .md / .canvas，见 BINARY_EXTENSIONS）：同一批清理里多张图共享一次读取和
+	 * 预处理；文件事件或 mtime/size 变化都会让对应条目失效并重读（见 withFreshTextCache）。
+	 * 读不出来的文件按「有引用」处理（fail-safe）。
 	 */
-	private async getVaultTexts(): Promise<{ file: TFile; text: string }[]> {
-		const files = this.app.vault.getFiles().filter((file) => file.extension === 'md' || file.extension === 'canvas');
+	private async getVaultTexts(): Promise<{ file: TFile; prepared: PreparedText }[]> {
+		const files = this.app.vault.getFiles().filter(isScannableTextFile);
 		const seen = new Set<string>();
-		const result: { file: TFile; text: string }[] = [];
+		const result: { file: TFile; prepared: PreparedText }[] = [];
 		for (const file of files) {
 			seen.add(file.path);
 			const { mtime, size } = stampOf(file);
 			const cached = this.textCache.get(file.path);
 			if (cached && cached.mtime === mtime && cached.size === size) {
-				result.push({ file, text: cached.text });
+				result.push({ file, prepared: cached.prepared });
 				continue;
 			}
-			const text = await this.app.vault.cachedRead(file);
+			let prepared: PreparedText;
+			try {
+				prepared = prepareText(await this.app.vault.cachedRead(file), file.extension);
+			} catch (error) {
+				console.warn(`CF ImageBed: could not read ${file.path} for the reference scan; treating it as a reference`, error);
+				prepared = { canvasFiles: null, unparsable: true, haystacks: [] };
+			}
 			// 读取期间该文件又变了（失效事件已触发）就不缓存这次结果
 			if (sameStamp(stampOf(file), { mtime, size })) {
-				this.textCache.set(file.path, { mtime, size, text });
+				this.textCache.set(file.path, { mtime, size, prepared });
 			}
-			result.push({ file, text });
+			result.push({ file, prepared });
 		}
 		for (const path of Array.from(this.textCache.keys())) {
 			if (!seen.has(path)) {
@@ -618,20 +652,47 @@ export function isSvgDocument(text: string): boolean {
 
 /** 文本（Markdown / Canvas / 视图数据）是否引用了该库内图片。 */
 export function textReferencesImage(text: string, extension: string, file: TFile): boolean {
-	if (extension === 'canvas') {
-		return canvasReferences(text, file);
-	}
-	return mentionsLocalFile(text, file.name);
+	return preparedReferences(prepareText(text, extension), file);
 }
 
 /**
  * 文本里是否提到该本地文件名。步骤：
- *  1. 删除指向远程 URL 的 Markdown 图片/链接（含 alt，上传后 `![pic.png](https://…/pic.png)` 的 alt 里仍是原文件名）、
- *     `<img src="http…">` 标签、以及裸 URL —— 远程链接不可能引用库内文件。
+ *  1. 删除指向远程 URL 的 Markdown 图片（含 alt，上传后 `![pic.png](https://…/pic.png)` 的 alt 里仍是原文件名）、
+ *     真正的 src 为远程的 `<img>` 标签、以及裸 URL —— 远程链接不可能引用库内文件。
  *  2. 解码 HTML 实体与百分号编码，让 `pic%201.png`、`pic&#32;1.png` 与 `pic 1.png` 一致。
- *  3. 小写后做子串匹配。
+ *  3. 小写后按文件名边界做子串匹配；Markdown 反斜杠转义前后的文本都查。
  */
 export function mentionsLocalFile(text: string, fileName: string): boolean {
+	return haystacksMention(buildHaystacks(text), fileName);
+}
+
+function prepareText(text: string, extension: string): PreparedText {
+	if (extension.toLowerCase() !== 'canvas') {
+		return { canvasFiles: null, unparsable: false, haystacks: buildHaystacks(text) };
+	}
+	// Canvas 是 JSON：解析失败按「有引用」处理；file 节点路径相同或原文出现文件名都算引用。
+	try {
+		const parsed = JSON.parse(text) as { nodes?: { type?: string; file?: string }[] };
+		const canvasFiles = new Set<string>();
+		for (const node of parsed?.nodes ?? []) {
+			if (typeof node.file === 'string') {
+				canvasFiles.add(node.file);
+			}
+		}
+		return { canvasFiles, unparsable: false, haystacks: buildHaystacks(text) };
+	} catch {
+		return { canvasFiles: null, unparsable: true, haystacks: [] };
+	}
+}
+
+function preparedReferences(prepared: PreparedText, file: TFile): boolean {
+	if (prepared.unparsable || prepared.canvasFiles?.has(file.path)) {
+		return true;
+	}
+	return haystacksMention(prepared.haystacks, file.name);
+}
+
+function buildHaystacks(text: string): string[] {
 	const stripped = text
 		// 只剔除「目标为远程 URL 的图片」整体：alt 是纯文本，上传后 alt 里仍是原文件名。
 		// alt 含 < 或 [ 的不剔除；普通链接 [text](http…) 一律不剔除——链接文本里可能嵌着本地 <img>。
@@ -642,10 +703,14 @@ export function mentionsLocalFile(text: string, fileName: string): boolean {
 		// 裸 URL 只剔除 URL 本身，不动它周围的链接文本或嵌套内容
 		.replace(/https?:\/\/[^\s)>"'\]]+/gi, ' ');
 	const normalized = safeDecodePercent(decodeHtmlEntities(stripped)).toLowerCase();
-	const needle = safeDecodePercent(decodeHtmlEntities(fileName)).toLowerCase();
 	// Markdown 反斜杠转义：`pic\(1\).png` 引用的是 `pic(1).png`。原文与解转义后的文本都查，任一命中即算引用。
 	const unescaped = normalized.replace(/\\([!-/:-@[-`{-~])/g, '$1');
-	return containsFileName(normalized, needle) || (unescaped !== normalized && containsFileName(unescaped, needle));
+	return unescaped === normalized ? [normalized] : [normalized, unescaped];
+}
+
+function haystacksMention(haystacks: string[], fileName: string): boolean {
+	const needle = safeDecodePercent(decodeHtmlEntities(fileName)).toLowerCase();
+	return haystacks.some((haystack) => containsFileName(haystack, needle));
 }
 
 /** <img …> 标签的 src 属性（按属性逐个解析，带引号的属性值整体跳过）是否为远程 URL。 */
@@ -711,17 +776,4 @@ function safeDecodePercent(value: string): string {
 			return match;
 		}
 	});
-}
-
-/** Canvas 是 JSON：解析失败按「有引用」处理；file 节点路径相同或原文出现文件名都算引用。 */
-function canvasReferences(text: string, file: TFile): boolean {
-	try {
-		const parsed = JSON.parse(text) as { nodes?: { type?: string; file?: string }[] };
-		if (parsed?.nodes?.some((node) => typeof node.file === 'string' && node.file === file.path)) {
-			return true;
-		}
-	} catch {
-		return true;
-	}
-	return mentionsLocalFile(text, file.name);
 }
