@@ -130,7 +130,8 @@ export class UploadService {
 				const shared = await inFlight;
 				if (shared) {
 					this.notifyReused(settings);
-					return { ...shared, reused: true };
+					// URL 按等待者自己的设置快照重建：在途请求用的可能是旧的返回前缀（自定义 CDN）
+					return { url: this.buildReturnUrl(shared.src, settings), src: shared.src, reused: true };
 				}
 			}
 
