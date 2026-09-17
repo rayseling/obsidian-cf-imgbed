@@ -439,9 +439,8 @@ export class AutoUploadWatcher {
 		} finally {
 			state.processing = false;
 			if (this.disposed) {
-				return;
-			}
-			if (state.rerun) {
+				// 已卸载：不再排队（不能在 finally 里 return，会吞掉在途异常）
+			} else if (state.rerun) {
 				state.rerun = false;
 				this.schedule(item.path, state.manual);
 			} else if (retryDelay !== null) {

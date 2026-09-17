@@ -135,24 +135,30 @@ export class CFImageBedSettingTab extends PluginSettingTab {
 		new Setting(container)
 			.setName(this.i18n.t('settings.basic.authCode.name'))
 			.setDesc(this.i18n.t('settings.basic.authCode.desc'))
-			.addText((text: TextComponent) => text
-				.setPlaceholder(this.i18n.t('settings.basic.authCode.placeholder'))
-				.setValue(this.plugin.settings.authCode)
-				.onChange(async (value: string) => {
-					this.plugin.settings.authCode = value;
-					await this.plugin.saveSettings();
-				}));
+			.addText((text: TextComponent) => {
+				text.inputEl.type = 'password'; // 凭证不明文回显
+				text
+					.setPlaceholder(this.i18n.t('settings.basic.authCode.placeholder'))
+					.setValue(this.plugin.settings.authCode)
+					.onChange(async (value: string) => {
+						this.plugin.settings.authCode = value;
+						await this.plugin.saveSettings();
+					});
+			});
 
 		new Setting(container)
 			.setName(this.i18n.t('settings.basic.apiToken.name'))
 			.setDesc(this.i18n.t('settings.basic.apiToken.desc'))
-			.addText((text: TextComponent) => text
-				.setPlaceholder(this.i18n.t('settings.basic.apiToken.placeholder'))
-				.setValue(this.plugin.settings.apiToken || '')
-				.onChange(async (value: string) => {
-					this.plugin.settings.apiToken = value.trim();
-					await this.plugin.saveSettings();
-				}));
+			.addText((text: TextComponent) => {
+				text.inputEl.type = 'password'; // 凭证不明文回显
+				text
+					.setPlaceholder(this.i18n.t('settings.basic.apiToken.placeholder'))
+					.setValue(this.plugin.settings.apiToken || '')
+					.onChange(async (value: string) => {
+						this.plugin.settings.apiToken = value.trim();
+						await this.plugin.saveSettings();
+					});
+			});
 
 		// 上传渠道设置
 		new Setting(container)

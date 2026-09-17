@@ -902,7 +902,12 @@ export class ImageHandler {
 	}
 
 	private isAbsoluteFileSystemPath(path: string): boolean {
-		return /^[a-zA-Z]:\//.test(path) || path.startsWith('//');
+		if (/^[a-zA-Z]:\//.test(path)) {
+			return true;
+		}
+		// `//server/share` 只在 Windows 上是 UNC 路径；macOS / Linux 上 `//etc/x.png` 就是 `/etc/x.png`，
+		// 不能让它绕过「只支持 Windows 绝对路径」的判定去读库外文件。
+		return Platform.isWin === true && path.startsWith('//');
 	}
 
 	private createFileFromAbsolutePath(linkPath: string): File | null {
@@ -1095,7 +1100,8 @@ export class ImageHandler {
 	}
 
 	private getFallbackImageName(path: string): string {
-		const sanitizedPath = decodeURIComponent(path.split('?')[0].split('#')[0]).replace(/\\/g, '/');
+		// `100%.png` 这类路径会让 decodeURIComponent 抛 URIError；粘贴已被接管时抛错等于丢内容
+		const sanitizedPath = this.safeDecode(path.split('?')[0].split('#')[0]).replace(/\\/g, '/');
 		const segments = sanitizedPath.split('/');
 		const lastSegment = segments[segments.length - 1] || 'image.png';
 		return lastSegment || 'image.png';

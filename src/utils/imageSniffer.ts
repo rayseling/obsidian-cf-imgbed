@@ -58,7 +58,7 @@ function looksLikeSvg(bytes: Uint8Array): boolean {
 	} catch {
 		return false;
 	}
-	const text = head.replace(/^﻿/, '').trimStart().toLowerCase();
+	const text = head.replace(/^\uFEFF/, '').trimStart().toLowerCase();
 	if (text.startsWith('<svg')) {
 		return true;
 	}

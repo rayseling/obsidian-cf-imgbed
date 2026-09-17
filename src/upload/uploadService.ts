@@ -1,5 +1,5 @@
 import { App, Notice, getLanguage, normalizePath, requestUrl, TFile, TFolder } from 'obsidian';
-import { CFImageBedSettings } from '../types';
+import { CFImageBedSettings, DEFAULT_SETTINGS } from '../types';
 import { ClientCompressor } from '../utils/clientCompressor';
 import { ClientWatermark } from '../utils/clientWatermark';
 import { buildCustomUploadFile, resolveTemplatePath } from '../utils/templateResolver';
@@ -102,8 +102,10 @@ export class UploadService {
 				return null;
 			}
 
-			// 检查文件大小
-			if (!this.isFileSizeAllowed(runtimeConfig.file, settings)) {
+			// 检查文件大小。开启客户端压缩且图片可压缩时，先压缩再按处理后的大小判断（见 performUpload），
+			// 否则压缩永远救不了超限的图片。
+			const willCompress = settings.enableClientCompress && ClientCompressor.isCompressible(runtimeConfig.file);
+			if (!willCompress && !this.isFileSizeAllowed(runtimeConfig.file, settings)) {
 				if (options.showErrorNotice !== false) {
 					new Notice(this.i18n.t('notices.fileSizeExceeded', {
 						size: ClientCompressor.formatFileSize(runtimeConfig.file.size)
@@ -190,6 +192,12 @@ export class UploadService {
 			this.debugLog(`CF ImageBed: Processing complete - Original: ${originalSize}, Processed: ${processedSize}`);
 		}
 
+		if (!this.isFileSizeAllowed(processedFile, settings)) {
+			throw new Error(this.i18n.t('notices.fileSizeExceeded', {
+				size: ClientCompressor.formatFileSize(processedFile.size)
+			}));
+		}
+
 		const result = this.shouldUseChunkedUpload(processedFile, settings)
 			? await this.chunkedUpload(processedFile, runtimeConfig, settings)
 			: await this.simpleUpload(processedFile, runtimeConfig, settings);
@@ -228,7 +236,9 @@ export class UploadService {
 		if (/^https?:\/\//i.test(src)) {
 			return src;
 		}
-		const baseUrl = (settings.customReturnBaseUrl?.trim() || settings.apiUrl).replace(/\/+$/, '');
+		// 自定义前缀不是合法 http(s) URL 时回退到 API URL：否则坏前缀会被永久写进笔记
+		const customBaseUrl = this.normalizeBaseUrl(settings.customReturnBaseUrl);
+		const baseUrl = customBaseUrl && this.isHttpUrl(customBaseUrl) ? customBaseUrl : this.normalizeBaseUrl(settings.apiUrl);
 		return `${baseUrl}${src.startsWith('/') ? '' : '/'}${src}`;
 	}
 
@@ -383,7 +393,7 @@ export class UploadService {
 		const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
 		const body = await this.buildMultipartBody(boundary, fields);
 		const response = await requestUrl({
-			url: `${settings.apiUrl}/upload?${params.toString()}`,
+			url: `${this.normalizeBaseUrl(settings.apiUrl)}/upload?${params.toString()}`,
 			method: 'POST',
 			body: body.buffer,
 			headers: this.getHeaders(boundary, settings)
@@ -408,7 +418,7 @@ export class UploadService {
 			if (value instanceof File) {
 				const header = encoder.encode(
 					`--${boundary}\r\n` +
-					`Content-Disposition: form-data; name="${name}"; filename="${value.name}"\r\n` +
+					`Content-Disposition: form-data; name="${name}"; filename="${this.escapeMultipartValue(value.name)}"\r\n` +
 					`Content-Type: ${value.type || 'application/octet-stream'}\r\n\r\n`
 				);
 				const content = new Uint8Array(await value.arrayBuffer());
@@ -577,7 +587,34 @@ export class UploadService {
 	 */
 	private isAllowedFileType(file: File, settings: CFImageBedSettings): boolean {
 		const extension = file.name.split('.').pop()?.toLowerCase();
-		return extension ? settings.allowedFileTypes.includes(extension) : false;
+		if (!extension) {
+			return false;
+		}
+		// 设置页原样保存用户输入：清空后得到 ['']（所有上传被拒），`JPG`、`.png` 这类写法永远匹配不上。
+		const configured = (settings.allowedFileTypes ?? [])
+			.map((type) => type.trim().toLowerCase().replace(/^\./, ''))
+			.filter((type) => type.length > 0);
+		const allowed = configured.length > 0 ? configured : DEFAULT_SETTINGS.allowedFileTypes;
+		return allowed.includes(extension);
+	}
+
+	/** multipart 头里的引号 / 换行必须转义，否则 `my"photo.png` 会破坏分段头，CRLF 可注入额外字段。 */
+	private escapeMultipartValue(value: string): string {
+		return value.replace(/[\r\n]+/g, ' ').replace(/"/g, '%22');
+	}
+
+	/** 去掉首尾空白和末尾斜杠，避免拼出 `//upload`。 */
+	private normalizeBaseUrl(value: string | undefined): string {
+		return (value ?? '').trim().replace(/\/+$/, '');
+	}
+
+	private isHttpUrl(value: string): boolean {
+		try {
+			const protocol = new URL(value).protocol;
+			return protocol === 'http:' || protocol === 'https:';
+		} catch {
+			return false;
+		}
 	}
 
 	/**

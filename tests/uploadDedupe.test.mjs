@@ -337,3 +337,49 @@ test('v1 and v2 index files are discarded regardless of the current API URL and 
 	await keep.load();
 	assert.equal(keep.size, 1);
 });
+
+// ---- 设置容错与请求构造 ----
+
+function decodeBody(request) {
+	return new TextDecoder().decode(new Uint8Array(request.body));
+}
+
+test('quotes and line breaks in a file name cannot break or inject multipart headers', async () => {
+	const calls = installServer();
+	const { service } = await createService(createSettings());
+	const evil = new NodeFile([Uint8Array.from([1, 2, 3])], 'my"photo\r\nContent-Disposition: form-data; name="uploadFolder"\r\n\r\nx.png', { type: 'image/png' });
+
+	await service.uploadImageDetailed(evil);
+
+	const body = decodeBody(calls[0]);
+	assert.equal((body.match(/name="uploadFolder"/g) ?? []).length, 0, 'no injected field');
+	assert.match(body, /filename="my%22photo Content-Disposition: form-data; name=%22uploadFolder%22 x\.png"\r\n/);
+});
+
+test('an emptied, upper-case or dotted allowedFileTypes setting does not reject every upload', async () => {
+	for (const allowedFileTypes of [[''], ['PNG', ' JPG '], ['.png']]) {
+		const calls = installServer();
+		const { service } = await createService(createSettings({ allowedFileTypes }));
+		const outcome = await service.uploadImageDetailed(png([4, 5, 6]));
+		assert.ok(outcome, JSON.stringify(allowedFileTypes));
+		assert.equal(calls.length, 1);
+	}
+	installServer();
+	const { service } = await createService(createSettings({ allowedFileTypes: ['jpg'] }));
+	assert.equal(await service.uploadImageDetailed(png([4, 5, 6]), { showErrorNotice: false }), null);
+});
+
+test('a malformed custom return prefix falls back to the API URL instead of writing broken links', async () => {
+	installServer();
+	const { service } = await createService(createSettings({ customReturnBaseUrl: 'cdn example com' }));
+	const outcome = await service.uploadImageDetailed(png([7, 8, 9]));
+	assert.equal(outcome.url, 'http://img.example:7658/file/upload-1.png');
+});
+
+test('trailing slashes and spaces in the API URL do not produce //upload', async () => {
+	const calls = installServer();
+	const { service } = await createService(createSettings({ apiUrl: ' http://img.example:7658/ ' }));
+	const outcome = await service.uploadImageDetailed(png([9, 9, 1]));
+	assert.match(calls[0].url, /^http:\/\/img\.example:7658\/upload\?/);
+	assert.equal(outcome.url, 'http://img.example:7658/file/upload-1.png');
+});

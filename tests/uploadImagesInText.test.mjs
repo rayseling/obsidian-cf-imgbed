@@ -118,3 +118,25 @@ test('unresolved vault images are reported so the watcher can wait for them; bad
 	assert.deepEqual(result.unresolvedLocal, ['not-yet.png', 'bad%zz.png']);
 	assert.equal(handler.countUploadableImages('![[a.png]] ![b](https://elsewhere.com/b.png) ![c](https://img.example/c.png)'), 1);
 });
+
+test('on macOS/Linux a // prefix is not a UNC path and never reaches fs.readFileSync, even in manual mode', async () => {
+	const { handler, uploadService } = createHandler([]);
+	const note = new TFile('notes/a.md');
+	absoluteReads = 0;
+
+	const result = await handler.uploadImagesInText('![x](//Users/me/private.png)\n![y](file:////etc/secret.png)', note, note.path);
+
+	assert.equal(absoluteReads, 0);
+	assert.equal(result.success, 0);
+	assert.deepEqual(uploadService.uploads, []);
+});
+
+test('a wiki embed whose name contains a bare % does not throw while building the replacement', async () => {
+	const { handler } = createHandler(['attachments/100%.png']);
+	const note = new TFile('notes/a.md');
+
+	const result = await handler.uploadImagesInText('![[100%.png]]', note, note.path);
+
+	assert.equal(result.success, 1);
+	assert.equal(result.content, '![100%.png](https://img.example/100%.png)');
+});
