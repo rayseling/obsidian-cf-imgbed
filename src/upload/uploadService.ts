@@ -34,6 +34,10 @@ export class UploadService {
 	private i18n = new I18n(resolveLanguage(getLanguage()));
 	/** 同一去重键的并发上传合并成一次请求。 */
 	private inFlight = new Map<string, Promise<UploadOutcome | null>>();
+	/** 备份的「选文件名 + 创建」必须串行：并发时两个任务会选中同一个尚不存在的路径，后者创建失败 = 漏备份。 */
+	private backupQueue: Promise<void> = Promise.resolve();
+	/** 开启客户端压缩时，超过 maxFileSize 的图片仍允许进入压缩，但解码前不得超过这个硬上限。 */
+	static maxDecodeSizeMB = 64;
 
 	constructor(
 		private app: App,
@@ -104,8 +108,13 @@ export class UploadService {
 
 			// 检查文件大小。开启客户端压缩且图片可压缩时，先压缩再按处理后的大小判断（见 performUpload），
 			// 否则压缩永远救不了超限的图片。
+			// 但压缩要先把整张图解码成位图：仍需一个解码前的硬上限，否则几百 MB 的文件会直接吃掉内存。
 			const willCompress = settings.enableClientCompress && ClientCompressor.isCompressible(runtimeConfig.file);
-			if (!willCompress && !this.isFileSizeAllowed(runtimeConfig.file, settings)) {
+			const decodeLimitBytes = Math.max(settings.maxFileSize, UploadService.maxDecodeSizeMB) * 1024 * 1024;
+			const tooLarge = willCompress
+				? runtimeConfig.file.size > decodeLimitBytes
+				: !this.isFileSizeAllowed(runtimeConfig.file, settings);
+			if (tooLarge) {
 				if (options.showErrorNotice !== false) {
 					new Notice(this.i18n.t('notices.fileSizeExceeded', {
 						size: ClientCompressor.formatFileSize(runtimeConfig.file.size)
@@ -511,14 +520,18 @@ export class UploadService {
 		return typeof value === 'string' ? value : null;
 	}
 
-	private async saveLocalBackup(file: File, backupPath: string): Promise<void> {
-		const normalized = normalizePath(backupPath);
-		const arrayBuffer = await file.arrayBuffer();
-		await this.ensureFolderExists(normalized);
-		const targetFilePath = await this.pickBackupFilePath(normalized, file.name, arrayBuffer);
-		if (targetFilePath) {
-			await this.app.vault.createBinary(targetFilePath, arrayBuffer);
-		}
+	private saveLocalBackup(file: File, backupPath: string): Promise<void> {
+		const task = this.backupQueue.then(async () => {
+			const normalized = normalizePath(backupPath);
+			const arrayBuffer = await file.arrayBuffer();
+			await this.ensureFolderExists(normalized);
+			const targetFilePath = await this.pickBackupFilePath(normalized, file.name, arrayBuffer);
+			if (targetFilePath) {
+				await this.app.vault.createBinary(targetFilePath, arrayBuffer);
+			}
+		});
+		this.backupQueue = task.catch(() => undefined);
+		return task;
 	}
 
 	/**

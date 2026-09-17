@@ -383,3 +383,16 @@ test('trailing slashes and spaces in the API URL do not produce //upload', async
 	assert.match(calls[0].url, /^http:\/\/img\.example:7658\/upload\?/);
 	assert.equal(outcome.url, 'http://img.example:7658/file/upload-1.png');
 });
+
+test('with client compression on, a file over the limit may proceed to compression but never past the decode cap', async () => {
+	const calls = installServer();
+	const { service } = await createService(createSettings({ enableClientCompress: true, maxFileSize: 1 }));
+	const mb = (count) => new NodeFile([new Uint8Array(count * 1024 * 1024)], 'big.png', { type: 'image/png' });
+
+	// 65MB > max(maxFileSize, 64MB)：解码前拒绝，不发请求
+	assert.equal(await service.uploadImageDetailed(mb(65), { showErrorNotice: false }), null);
+	assert.equal(calls.length, 0);
+	// 2MB > maxFileSize：允许进入压缩；Node 下压缩回退为原图，压缩后的大小检查仍然拒绝
+	assert.equal(await service.uploadImageDetailed(mb(2), { showErrorNotice: false }), null);
+	assert.equal(calls.length, 0);
+});

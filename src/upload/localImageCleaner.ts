@@ -111,6 +111,8 @@ export class LocalImageCleaner {
 	private textCache = new Map<string, { mtime: number; size: number; prepared: PreparedText }>();
 	/** 正在进行的清理批次数；>0 时订阅库事件让 textCache 失效，见 withFreshTextCache。 */
 	private activeRuns = 0;
+	/** 每个路径的变更版本号：库事件到来时 +1。读取前后版本不一致 = 读到的可能是旧内容。 */
+	private textGeneration = new Map<string, number>();
 	private stopCacheInvalidation: (() => void) | null = null;
 	/** 插件卸载后置位：在途清理不再删除任何文件。 */
 	private disposed = false;
@@ -217,6 +219,8 @@ export class LocalImageCleaner {
 			if (await this.isReferenced(file) || this.hasOpenViewReference(file)) {
 				continue;
 			}
+			// 大库里这是 图片数 × 文本量 的扫描：每张图让出一次主线程，界面不至于卡死
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
 			orphans.push({ file, src: indexed.src, url: this.buildUrl(indexed.src) });
 		}
 		return orphans;
@@ -319,11 +323,11 @@ export class LocalImageCleaner {
 			const refs = ['create', 'modify', 'delete', 'rename'].map((name) =>
 				vault.on(name, (file: unknown, oldPath: unknown) => {
 					const path = (file as { path?: string } | null)?.path;
-					if (path) {
-						this.textCache.delete(path);
-					}
-					if (typeof oldPath === 'string') {
-						this.textCache.delete(oldPath);
+					for (const changed of [path, oldPath]) {
+						if (typeof changed === 'string') {
+							this.textCache.delete(changed);
+							this.textGeneration.set(changed, (this.textGeneration.get(changed) ?? 0) + 1);
+						}
 					}
 				})
 			);
@@ -336,6 +340,7 @@ export class LocalImageCleaner {
 				this.stopCacheInvalidation?.();
 				this.stopCacheInvalidation = null;
 				this.textCache.clear();
+				this.textGeneration.clear();
 			}
 		}
 	}
@@ -498,16 +503,24 @@ export class LocalImageCleaner {
 				result.push({ file, prepared: cached.prepared });
 				continue;
 			}
-			let prepared: PreparedText;
-			try {
-				prepared = prepareText(await this.app.vault.cachedRead(file), file.extension);
-			} catch (error) {
-				console.warn(`CF ImageBed: could not read ${file.path} for the reference scan; treating it as a reference`, error);
-				prepared = { canvasFiles: null, unparsable: true, haystacks: [] };
-			}
-			// 读取期间该文件又变了（失效事件已触发）就不缓存这次结果
-			if (sameStamp(stampOf(file), { mtime, size })) {
-				this.textCache.set(file.path, { mtime, size, prepared });
+			// 读取是异步的：读到一半文件被改（哪怕等长、同时间戳），这次读到的就是旧内容。
+			// 用变更版本号判断，变了就重读；一直在变就按「有引用」处理，绝不把旧内容放回缓存。
+			let prepared: PreparedText = { canvasFiles: null, unparsable: true, haystacks: [] };
+			for (let attempt = 0; attempt < 3; attempt++) {
+				const generation = this.textGeneration.get(file.path) ?? 0;
+				const stamp = stampOf(file);
+				let read: PreparedText;
+				try {
+					read = prepareText(await this.app.vault.cachedRead(file), file.extension);
+				} catch (error) {
+					console.warn(`CF ImageBed: could not read ${file.path} for the reference scan; treating it as a reference`, error);
+					break;
+				}
+				if ((this.textGeneration.get(file.path) ?? 0) === generation && sameStamp(stampOf(file), stamp)) {
+					prepared = read;
+					this.textCache.set(file.path, { ...stamp, prepared });
+					break;
+				}
 			}
 			result.push({ file, prepared });
 		}
@@ -697,9 +710,10 @@ function buildHaystacks(text: string): string[] {
 		// 只剔除「目标为远程 URL 的图片」整体：alt 是纯文本，上传后 alt 里仍是原文件名。
 		// alt 含 < 或 [ 的不剔除；普通链接 [text](http…) 一律不剔除——链接文本里可能嵌着本地 <img>。
 		.replace(/!\[[^\]<[]*\]\(\s*<?https?:\/\/[^)]*\)/gi, ' ')
-		// 只剔除「真正的 src 属性」为远程的 <img>。必须按属性逐个解析：alt="… src=https:…" 这种
-		// 属性值里的文字不是 src，否则整个标签被剔除，真正的本地 src 就漏掉了。
-		.replace(/<img\b[^>]*>/gi, (tag) => (hasRemoteImgSrc(tag) ? ' ' : tag))
+		// 「真正的 src 属性」为远程的 <img>：只去掉 alt / title 这类纯文字属性（上传后 alt 里仍是原文件名），
+		// 标签其余部分保留——srcset、data-* 等属性仍可能指向本地文件。必须按属性逐个解析：
+		// alt="… src=https:…" 这种属性值里的文字不是 src。
+		.replace(/<img\b[^>]*>/gi, (tag) => (hasRemoteImgSrc(tag) ? stripImgTextAttributes(tag) : tag))
 		// 裸 URL 只剔除 URL 本身，不动它周围的链接文本或嵌套内容
 		.replace(/https?:\/\/[^\s)>"'\]]+/gi, ' ');
 	const normalized = safeDecodePercent(decodeHtmlEntities(stripped)).toLowerCase();
@@ -713,10 +727,20 @@ function haystacksMention(haystacks: string[], fileName: string): boolean {
 	return haystacks.some((haystack) => containsFileName(haystack, needle));
 }
 
+const IMG_ATTRIBUTE_PATTERN = /([^\s"'=<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+
+/** 去掉 <img> 的 alt / title 属性，其余属性原样保留。 */
+function stripImgTextAttributes(tag: string): string {
+	const body = tag.replace(/^<img\b/i, '').replace(/\/?>$/, '');
+	const kept = body.replace(new RegExp(IMG_ATTRIBUTE_PATTERN.source, 'g'), (attribute: string, name: string) =>
+		(/^(alt|title)$/i.test(name) ? ' ' : attribute));
+	return `<img${kept}>`;
+}
+
 /** <img …> 标签的 src 属性（按属性逐个解析，带引号的属性值整体跳过）是否为远程 URL。 */
 function hasRemoteImgSrc(tag: string): boolean {
 	const attributes = tag.replace(/^<img\b/i, '').replace(/\/?>$/, '');
-	const pattern = /([^\s"'=<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+	const pattern = new RegExp(IMG_ATTRIBUTE_PATTERN.source, 'g');
 	for (let match = pattern.exec(attributes); match; match = pattern.exec(attributes)) {
 		if (match[1].toLowerCase() === 'src') {
 			const value = (match[2] ?? match[3] ?? match[4] ?? '').trim();

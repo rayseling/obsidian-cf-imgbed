@@ -175,3 +175,10 @@ test('private addresses are fetched once the user explicitly allows them', async
 	assert.equal(result.success, 1);
 	assert.equal(uploadService.uploads.length, 1);
 });
+
+test('wildcard-DNS names and deprecated IPv4-compatible IPv6 literals are treated as private', () => {
+	for (const url of ['http://127.0.0.1.nip.io/a.png', 'http://app.10-0-0-5.sslip.io/a.png', 'http://lvh.me/a.png', 'http://[::127.0.0.1]/a.png', 'http://[::c0a8:101]/a.png']) {
+		assert.equal(classifyRemoteHost(url), 'private', url);
+	}
+	assert.equal(classifyRemoteHost('http://[::808:808]/a.png'), 'public');
+});

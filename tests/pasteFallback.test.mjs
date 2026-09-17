@@ -269,3 +269,47 @@ test('rich-text paste keeps the body text and only swaps the image links', async
 
 	assert.equal(editor.text, 'First paragraph.\n\n![](https://img.example/pic.png)Second paragraph.');
 });
+
+test('a multi-image drop creates every placeholder up front, so text selected mid-batch is not replaced by the second image', async () => {
+	const note = new TFile('inbox/a.md');
+	const app = createApp(note);
+	const editor = createEditor('intro body', [6, 6]);
+	app.workspace.getActiveViewOfType = () => ({ editor });
+	const releases = [];
+	const uploadService = { uploadImage: () => new Promise((resolve) => releases.push(resolve)) };
+	const handler = new ImageHandler(app, uploadService, () => baseSettings, { t: (key) => key });
+	const files = ['one.png', 'two.png'].map((name) => new NodeFile([Uint8Array.from([1])], name, { type: 'image/png' }));
+
+	const batch = handler.uploadImageFilesToEditor(files);
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	assert.match(editor.text, /^intro !\[⏳ one\.png \w+\]\(\)!\[⏳ two\.png \w+\]\(\)body$/);
+	editor.selection = [0, 5]; // 第一张还在上传时，用户选中了 "intro"
+	releases[0]('https://img.example/one.png');
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	releases[1]('https://img.example/two.png');
+	await batch;
+
+	assert.equal(editor.text, 'intro ![one.png](https://img.example/one.png)![two.png](https://img.example/two.png)body');
+});
+
+test('when the same tab switched to another note, the placeholder is resolved in the original note on disk', async () => {
+	const note = new TFile('inbox/a.md');
+	const app = createApp(note);
+	const editor = createEditor('');
+	const view = { editor, file: note };
+	let disk = null;
+	app.workspace.getLeavesOfType = () => [{ view }];
+	app.vault.process = async (file, update) => { assert.equal(file.path, 'inbox/a.md'); disk = update(disk); return disk; };
+	const { handler, release } = createDeferredHandler(app);
+
+	const paste = pasteImage(handler, editor);
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	disk = editor.text; // Obsidian 切换笔记前会先保存原笔记
+	view.file = new TFile('inbox/b.md');
+	editor.text = 'content of note b';
+	release('https://img.example/ok.png');
+	await paste;
+
+	assert.equal(disk, '![image.png](https://img.example/ok.png)');
+	assert.equal(editor.text, 'content of note b', 'the other note must not be touched');
+});

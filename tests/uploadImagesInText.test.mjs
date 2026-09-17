@@ -140,3 +140,13 @@ test('a wiki embed whose name contains a bare % does not throw while building th
 	assert.equal(result.success, 1);
 	assert.equal(result.content, '![100%.png](https://img.example/100%.png)');
 });
+
+test('UNC paths are never read, so note content cannot make the machine open an SMB connection', async () => {
+	const { handler, uploadService } = createHandler([]);
+	const note = new TFile('notes/a.md');
+	absoluteReads = 0;
+	const result = await handler.uploadImagesInText('![x](//evil.example/share/x.png)\n![y](\\\\evil.example\\share\\y.png)', note, note.path);
+	assert.equal(absoluteReads, 0);
+	assert.deepEqual(uploadService.uploads, []);
+	assert.equal(result.success, 0);
+});

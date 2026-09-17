@@ -67,11 +67,14 @@ export class ClientCompressor {
 			);
 
 			// 设置画布尺寸
-			canvas.width = Math.max(1, width);
-			canvas.height = Math.max(1, height);
+			// 极端宽高比下按比例算出的边可能为 0：画布和绘制区域必须用同一组修正后的尺寸，否则得到空图
+			const drawWidth = Math.max(1, width);
+			const drawHeight = Math.max(1, height);
+			canvas.width = drawWidth;
+			canvas.height = drawHeight;
 
 			// 绘制压缩后的图片
-			ctx.drawImage(img, 0, 0, width, height);
+			ctx.drawImage(img, 0, 0, drawWidth, drawHeight);
 
 			// 转换为 Blob
 			const compressedBlob = await new Promise<Blob>((resolve, reject) => {

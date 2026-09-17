@@ -103,15 +103,21 @@ export class ExcalidrawSceneUploadTracker {
 			return;
 		}
 
+		// 同一个视图可以切到另一块画板；新画板里若有相同 fileId 的图片，不能被这次上传改写
+		const sourceFilePath = view.file?.path ?? null;
 		await this.imageHandler.uploadImageToExcalidraw(file, view.file ?? null, async (imageUrl) => {
 			if (!this.isEnabled()) {
 				return;
 			}
 
-			const findCurrentElements = (): ExcalidrawImageElement[] =>
-				(view.getScene?.()?.elements ?? []).filter((element) =>
+			const findCurrentElements = (): ExcalidrawImageElement[] => {
+				if ((view.file?.path ?? null) !== sourceFilePath) {
+					return [];
+				}
+				return (view.getScene?.()?.elements ?? []).filter((element) =>
 					isImageElement(element) && element.fileId === sourceFileId
 				) as ExcalidrawImageElement[];
+			};
 			if (findCurrentElements().length === 0) {
 				return;
 			}

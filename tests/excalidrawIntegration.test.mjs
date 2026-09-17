@@ -357,6 +357,23 @@ test('an image deleted while the uploaded file loads is not resurrected', async 
 	}
 });
 
+test('switching the view to another drawing that reuses the same fileId leaves that drawing untouched', async () => {
+	const context = setup(true);
+	try {
+		await replaceNativeImageWhile(context, () => {
+			context.view.file = { name: 'other.excalidraw.md', extension: 'md', path: 'other.excalidraw.md' };
+			context.view.scene = {
+				...context.view.scene,
+				elements: [{ id: 'other-image', type: 'image', fileId: 'native-file', x: 1, y: 2 }]
+			};
+		});
+		assert.equal(context.automate.commits.length, 0);
+		assert.equal(context.view.scene.elements[0].fileId, 'native-file');
+	} finally {
+		context.cleanup();
+	}
+});
+
 test('external image dragover enables dropping only while takeover is enabled', () => {
 	const enabledContext = setup(true);
 	try {

@@ -78,9 +78,16 @@ export class ImageHandler {
 			return;
 		}
 		const noteFile = this.app.workspace.getActiveFile();
-		for (const file of files) {
-			await this.uploadImageToEditor(file, targetEditor, noteFile);
+		// 整批的占位符必须在第一次 await 之前全部插好：逐张插入的话，第一张上传期间用户选中的文字
+		// 会被第二张的 replaceSelection 覆盖。
+		const targets = files.map((file) => this.createPendingInsertion(file, targetEditor, noteFile));
+		for (let index = 0; index < files.length; index++) {
+			await this.completeEditorUpload(files[index], targets[index]);
 		}
+	}
+
+	private createPendingInsertion(file: File, editor: Editor, noteFile: TFile | null): PendingInsertion {
+		return { editor, noteFile, placeholder: this.insertUploadPlaceholder(editor, file.name) };
 	}
 
 	private getInputFileFromEvent(event: Event): File | null {
@@ -505,19 +512,19 @@ export class ImageHandler {
 			return;
 		}
 		const noteFile = capturedNoteFile !== undefined ? capturedNoteFile : this.app.workspace.getActiveFile();
+		await this.completeEditorUpload(file, this.createPendingInsertion(file, targetEditor, noteFile));
+	}
 
+	/**
+	 * 上传是异步的：占位符已在发起位置插好（createPendingInsertion），这里完成后只替换占位符。
+	 * 直接在完成时 replaceSelection 会覆盖用户上传期间新选中的文字，或插到别的位置。
+	 */
+	private async completeEditorUpload(file: File, target: PendingInsertion): Promise<void> {
+		const { noteFile } = target;
 		const settings = this.getSettings?.();
 		if (settings?.showUploadProgress) {
 			new Notice(this.i18n?.t('notices.uploadingImage') || 'Uploading image...');
 		}
-
-		// 上传是异步的：先在发起位置插入占位符，完成后只替换占位符。
-		// 直接在完成时 replaceSelection 会覆盖用户上传期间新选中的文字，或插到别的位置。
-		const target: PendingInsertion = {
-			editor: targetEditor,
-			noteFile,
-			placeholder: this.insertUploadPlaceholder(targetEditor, file.name)
-		};
 
 		const imageUrl = await this.uploadService.uploadImage(file, { noteFile });
 		if (!imageUrl) {
@@ -676,7 +683,7 @@ export class ImageHandler {
 	 */
 	private async resolveUploadPlaceholder(target: PendingInsertion, replacement: string): Promise<boolean> {
 		const { editor, noteFile, placeholder } = target;
-		if (this.isEditorAttached(editor)) {
+		if (this.isEditorShowing(editor, noteFile)) {
 			const index = editor.getValue().indexOf(placeholder);
 			if (index < 0) {
 				return false;
@@ -704,13 +711,20 @@ export class ImageHandler {
 		return replaced;
 	}
 
-	/** 编辑器所属的视图是否还开着；关掉后的 Editor 对象仍可读写，但写入不会落到任何笔记里。 */
-	private isEditorAttached(editor: Editor): boolean {
+	/**
+	 * 编辑器所属的视图是否还开着，且显示的仍是发起上传的那篇笔记。关掉后的 Editor 对象仍可读写，
+	 * 但写入不会落到任何笔记里；同一个标签页切到别的笔记后 Editor 对象不变，内容却是另一篇——
+	 * 这两种情况都改走磁盘上的原笔记。
+	 */
+	private isEditorShowing(editor: Editor, noteFile: TFile | null): boolean {
 		const workspace = this.app.workspace;
 		if (typeof workspace?.getLeavesOfType !== 'function') {
 			return true;
 		}
-		return workspace.getLeavesOfType('markdown').some((leaf) => (leaf.view as MarkdownView)?.editor === editor);
+		return workspace.getLeavesOfType('markdown').some((leaf) => {
+			const view = leaf.view as MarkdownView;
+			return view?.editor === editor && (!noteFile || view.file?.path === noteFile.path);
+		});
 	}
 
 	private notifyPlaceholderLost(content: string): void {
@@ -903,12 +917,10 @@ export class ImageHandler {
 	}
 
 	private isAbsoluteFileSystemPath(path: string): boolean {
-		if (/^[a-zA-Z]:\//.test(path)) {
-			return true;
-		}
-		// `//server/share` 只在 Windows 上是 UNC 路径；macOS / Linux 上 `//etc/x.png` 就是 `/etc/x.png`，
-		// 不能让它绕过「只支持 Windows 绝对路径」的判定去读库外文件。
-		return Platform.isWin === true && path.startsWith('//');
+		// 只认盘符路径。`//host/share` 不再支持：macOS / Linux 上它就是 `/host/share`（可读任意库外文件），
+		// Windows 上读取 UNC 路径会主动向该主机发起 SMB 连接并可能泄露 NTLM 凭证——
+		// 笔记内容不应该能让本机去连任意主机。需要网络共享里的图片请先映射成盘符。
+		return /^[a-zA-Z]:\//.test(path);
 	}
 
 	private createFileFromAbsolutePath(linkPath: string): File | null {

@@ -657,3 +657,46 @@ test('known binary files are not scanned, and an SVG mentioning its own name is 
 	const orphans = await svgCtx.cleaner.findOrphans();
 	assert.ok(orphans.some((item) => item.file.path === 'attachments/logo.svg'));
 });
+
+test('a local srcset / data attribute on an <img> with a remote src still counts as a reference', async () => {
+	for (const html of [
+		'<img src="https://example.com/a.png" srcset="attachments/pic.png 1x">',
+		'<img alt="pic.png" src="https://example.com/a.png" data-original="attachments/pic.png">',
+		"<img src='https://example.com/a.png' srcset='https://example.com/a.png 1x, attachments/pic.png 2x'>"
+	]) {
+		const ctx = await setup();
+		ctx.app.vault.addText('notes/html.md', html);
+		const report = await runAfterWriteBack(ctx);
+		assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'referenced' }], html);
+		assert.deepEqual(ctx.app.trashed, []);
+	}
+	// 只有 alt / title 提到文件名、资源属性全是远程的，仍然不算引用
+	const ctx = await setup();
+	ctx.app.vault.addText('notes/html.md', '<img title="pic.png" alt="pic.png" src="https://example.com/a.png" srcset="https://example.com/pic.png 2x">');
+	assert.deepEqual((await runAfterWriteBack(ctx)).deleted, ['attachments/pic.png']);
+});
+
+test('a read that was in flight when the file changed (same size, same mtime) cannot re-poison the cache', async () => {
+	const ctx = await setup();
+	const other = ctx.app.vault.addText('notes/other.md', 'nothing here yet 0');
+	const cachedRead = ctx.app.vault.cachedRead;
+	let raced = false;
+	ctx.app.vault.cachedRead = async (file) => {
+		const stale = await cachedRead(file);
+		if (file.path === 'notes/other.md' && !raced) {
+			raced = true;
+			// 旧内容已读出、尚未返回：此刻文件被等长、同时间戳地改写，并发出 modify
+			const mtime = other.stat.mtime;
+			ctx.app.vault.setText('notes/other.md', '![[pic.png]] 00000');
+			other.stat.mtime = mtime;
+			ctx.app.vault.emit('modify', other);
+		}
+		return stale;
+	};
+
+	const report = await runAfterWriteBack(ctx);
+
+	assert.ok(raced);
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'referenced' }]);
+	assert.deepEqual(ctx.app.trashed, []);
+});

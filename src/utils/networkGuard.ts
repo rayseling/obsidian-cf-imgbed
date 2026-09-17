@@ -27,6 +27,10 @@ export function classifyRemoteHost(url: string): RemoteHostKind {
 		|| host.endsWith('.internal') || host.endsWith('.lan') || host.endsWith('.home.arpa')) {
 		return 'private';
 	}
+	// 公共通配 DNS：127.0.0.1.nip.io 这类域名按名字里的 IP 解析，是绕过主机名检查的现成工具
+	if (WILDCARD_DNS_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) {
+		return 'private';
+	}
 	if (host.includes(':')) {
 		return isPrivateIpv6(host) ? 'private' : 'public';
 	}
@@ -38,6 +42,8 @@ export function classifyRemoteHost(url: string): RemoteHostKind {
 	// 没有点的裸主机名（http://nas/、http://router/）只可能解析到内网
 	return host.includes('.') ? 'public' : 'private';
 }
+
+const WILDCARD_DNS_SUFFIXES = ['nip.io', 'sslip.io', 'xip.io', 'traefik.me', 'localtest.me', 'lvh.me', 'vcap.me'];
 
 /** 支持 WHATWG URL 已归一化的点分十进制；URL 解析器会把 0x7f.1、2130706433 这类写法归一成 127.0.0.1。 */
 function parseIpv4(host: string): number[] | null {
@@ -63,6 +69,13 @@ function isPrivateIpv4([a, b]: number[]): boolean {
 function isPrivateIpv6(host: string): boolean {
 	if (host === '::' || host === '::1') {
 		return true;
+	}
+	// 已弃用的 IPv4 兼容地址 ::a.b.c.d（URL 解析器归一成 ::hhhh:hhhh）：部分系统仍会映射到 IPv4
+	const compatible = host.match(/^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+	if (compatible) {
+		const high = parseInt(compatible[1], 16);
+		const low = parseInt(compatible[2], 16);
+		return isPrivateIpv4([high >> 8, high & 0xff, low >> 8, low & 0xff]);
 	}
 	// IPv4 映射地址 ::ffff:a.b.c.d / ::ffff:hhhh:hhhh
 	const mapped = host.match(/^::ffff:(.+)$/);

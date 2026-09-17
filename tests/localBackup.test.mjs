@@ -120,3 +120,15 @@ test('an existing file in the backup folder (e.g. the original attachment) is ne
 	assert.deepEqual(Array.from(vault.contents.get('backup/image-1.png')), [1, 2, 3]);
 	assert.deepEqual(vault.modified, []);
 });
+
+test('concurrent uploads of different images with the same name are all backed up', async () => {
+	const vault = createVault();
+	const createBinary = vault.createBinary.bind(vault);
+	// 真实写盘有延迟：并发任务会在对方创建完成之前选中同一个「尚不存在」的路径
+	vault.createBinary = async (p, data) => { await new Promise((resolve) => setTimeout(resolve, 5)); return createBinary(p, data); };
+	const service = createService(vault);
+
+	await Promise.all([[1, 1], [2, 2], [3, 3]].map((bytes) => service.uploadImageDetailed(image(bytes))));
+
+	assert.deepEqual(Array.from(vault.contents.keys()).sort(), ['backup/image-1.png', 'backup/image-2.png', 'backup/image.png']);
+});
