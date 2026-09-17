@@ -97,12 +97,13 @@ export class ClientWatermark {
 			ctx.fillText(watermarkText, positionData.x, positionData.y);
 
 			// 转换为 Blob
-			const watermarkedBlob = await new Promise<Blob>((resolve) => {
+			const watermarkedBlob = await new Promise<Blob>((resolve, reject) => {
 				canvas.toBlob((blob) => {
 					if (blob) {
 						resolve(blob);
 					} else {
-						throw new Error(this.i18n.t('errors.watermarkApplyFailed'));
+						// 回调里 throw 不会让外层 Promise 失败，上传会永久挂起；必须 reject
+						reject(new Error(this.i18n.t('errors.watermarkApplyFailed')));
 					}
 				}, file.type, 0.9);
 			});

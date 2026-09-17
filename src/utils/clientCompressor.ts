@@ -67,19 +67,20 @@ export class ClientCompressor {
 			);
 
 			// 设置画布尺寸
-			canvas.width = width;
-			canvas.height = height;
+			canvas.width = Math.max(1, width);
+			canvas.height = Math.max(1, height);
 
 			// 绘制压缩后的图片
 			ctx.drawImage(img, 0, 0, width, height);
 
 			// 转换为 Blob
-			const compressedBlob = await new Promise<Blob>((resolve) => {
+			const compressedBlob = await new Promise<Blob>((resolve, reject) => {
 				canvas.toBlob((blob) => {
 					if (blob) {
 						resolve(blob);
 					} else {
-						throw new Error('压缩失败');
+						// 回调里 throw 不会让外层 Promise 失败，上传会永久挂起；必须 reject
+						reject(new Error('压缩失败'));
 					}
 				}, 'image/jpeg', 0.8); // 使用 JPEG 格式，质量 0.8
 			});
