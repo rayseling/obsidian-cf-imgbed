@@ -504,14 +504,49 @@ export class UploadService {
 		const normalized = normalizePath(backupPath);
 		const arrayBuffer = await file.arrayBuffer();
 		await this.ensureFolderExists(normalized);
-		const targetFilePath = normalizePath(`${normalized}/${file.name}`);
-		// 如果存在则覆盖
-		const existing = this.app.vault.getAbstractFileByPath(targetFilePath);
-		if (existing && existing instanceof TFile) {
-			await this.app.vault.modifyBinary(existing, arrayBuffer);
-		} else {
+		const targetFilePath = await this.pickBackupFilePath(normalized, file.name, arrayBuffer);
+		if (targetFilePath) {
 			await this.app.vault.createBinary(targetFilePath, arrayBuffer);
 		}
+	}
+
+	/**
+	 * 备份绝不覆盖已有文件：同名图片（如多张 image.png）会互相覆盖，备份目录与附件目录重合时
+	 * 还会用压缩 / 水印后的版本覆盖原图。同名且内容相同 → 已备份，返回 null；内容不同 → 追加序号。
+	 */
+	private async pickBackupFilePath(folder: string, fileName: string, data: ArrayBuffer): Promise<string | null> {
+		const dotIndex = fileName.lastIndexOf('.');
+		const baseName = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
+		const extension = dotIndex > 0 ? fileName.slice(dotIndex) : '';
+
+		for (let attempt = 0; attempt < 1000; attempt++) {
+			const candidateName = attempt === 0 ? fileName : `${baseName}-${attempt}${extension}`;
+			const candidatePath = normalizePath(`${folder}/${candidateName}`);
+			const existing = this.app.vault.getAbstractFileByPath(candidatePath);
+			if (!existing) {
+				return candidatePath;
+			}
+			if (existing instanceof TFile && existing.stat.size === data.byteLength
+				&& this.sameBytes(await this.app.vault.readBinary(existing), data)) {
+				return null;
+			}
+		}
+
+		return normalizePath(`${folder}/${baseName}-${Date.now()}${extension}`);
+	}
+
+	private sameBytes(left: ArrayBuffer, right: ArrayBuffer): boolean {
+		if (left.byteLength !== right.byteLength) {
+			return false;
+		}
+		const leftBytes = new Uint8Array(left);
+		const rightBytes = new Uint8Array(right);
+		for (let index = 0; index < leftBytes.length; index++) {
+			if (leftBytes[index] !== rightBytes[index]) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	private async ensureFolderExists(folderPath: string): Promise<void> {
