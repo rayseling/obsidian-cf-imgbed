@@ -13,6 +13,7 @@ import {
 import { getEffectiveExcludedDomains, isUrlExcluded } from '../utils/domainUtils';
 import { LocalImageCleaner, UploadedVaultImage } from './localImageCleaner';
 import { isAutoUploadActiveFor } from '../utils/autoUploadScope';
+import { sniffImageMimeType } from '../utils/imageSniffer';
 
 interface TextReplacement {
 	index: number;
@@ -915,7 +916,15 @@ export class ImageHandler {
 			response.headers['content-type'] ||
 			response.headers['Content-Type'] ||
 			'';
-		const contentType = contentTypeHeader.split(';')[0].trim().toLowerCase();
+		// 响应头和 URL 扩展名都不可信：内网管理页 / 登录页 / 错误页同样返回 200。
+		// 必须按文件头确认是真实图片，否则 HTML 会被包装成 .png 传到图床。
+		const sniffedMimeType = sniffImageMimeType(response.arrayBuffer);
+		if (!sniffedMimeType) {
+			throw new Error('远程链接不是图片');
+		}
+
+		const headerContentType = contentTypeHeader.split(';')[0].trim().toLowerCase();
+		const contentType = headerContentType.startsWith('image/') ? headerContentType : sniffedMimeType;
 		const urlExtension = this.getExtensionFromUrl(url);
 		const mimeExtension = this.getExtensionFromMimeType(contentType);
 		const extension = mimeExtension || urlExtension || 'png';
