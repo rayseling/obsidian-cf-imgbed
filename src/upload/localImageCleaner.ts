@@ -591,7 +591,20 @@ export function mentionsLocalFile(text: string, fileName: string): boolean {
 		.replace(/https?:\/\/[^\s)>"'\]]+/gi, ' ');
 	const normalized = safeDecodePercent(decodeHtmlEntities(stripped)).toLowerCase();
 	const needle = safeDecodePercent(decodeHtmlEntities(fileName)).toLowerCase();
-	return normalized.includes(needle);
+	// 按文件名边界匹配：命中位置的前一个字符不能是文件名字符，否则 `shared.png` 会被当成
+	// 对 `red.png` 的引用（真实库验收中发现：保守方向的误判，会让图片永远清不掉）。
+	let from = 0;
+	for (;;) {
+		const at = normalized.indexOf(needle, from);
+		if (at === -1) {
+			return false;
+		}
+		const before = at === 0 ? '' : normalized[at - 1];
+		if (before === '' || !/[\p{L}\p{N}_.\-~]/u.test(before)) {
+			return true;
+		}
+		from = at + 1;
+	}
 }
 
 function decodeHtmlEntities(value: string): string {

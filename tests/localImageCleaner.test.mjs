@@ -518,3 +518,19 @@ test('turning the setting off or unloading the plugin while a cleanup is in flig
 	report = await orphan.cleaner.cleanupOrphans(orphan.uploaded);
 	assert.deepEqual(report.deleted, ['attachments/pic.png']);
 });
+
+test('a file name that is only the tail of another file name is not a reference (shared.png vs red.png)', async () => {
+	const ctx = await setup();
+	// pic.png 是 "topic.png" 的尾部：对 topic.png 的引用不应保护 pic.png
+	ctx.app.vault.addText('notes/other.md', '<img src="attachments/topic.png"> and ![[my-pic.png]] and epic.png');
+	let report = await runAfterWriteBack(ctx);
+	assert.deepEqual(report.deleted, ['attachments/pic.png']);
+
+	// 真正的引用（前面是路径分隔符、括号、引号、空白）仍然保护
+	for (const text of ['<img src="attachments/pic.png">', '![[pic.png]]', '(pic.png)', 'see pic.png here', 'pic.png']) {
+		const kept = await setup();
+		kept.app.vault.addText('notes/other.md', text);
+		report = await runAfterWriteBack(kept);
+		assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'referenced' }], text);
+	}
+});
