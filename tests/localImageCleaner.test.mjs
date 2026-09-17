@@ -534,3 +534,75 @@ test('a file name that is only the tail of another file name is not a reference 
 		assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'referenced' }], text);
 	}
 });
+
+test('text inside an <img> alt that looks like a remote src does not hide the real local src', async () => {
+	for (const html of [
+		'<img alt="see src=https://example/remote.png" src="attachments/pic.png">',
+		"<img alt='x src=\"https://example/remote.png\"' src='attachments/pic.png'>",
+		'<img title="a > b src=https://example/r.png" src="attachments/pic.png">'
+	]) {
+		const ctx = await setup();
+		ctx.app.vault.addText('notes/html.md', html);
+		const report = await runAfterWriteBack(ctx);
+		assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'referenced' }], html);
+		assert.deepEqual(ctx.app.trashed, []);
+	}
+});
+
+test('an <img> whose real src is remote still does not count its alt as a reference', async () => {
+	const ctx = await setup();
+	ctx.app.vault.addText('notes/html.md', '<img alt="pic.png" src="http://img.example:7658/file/pic.png">');
+	const report = await runAfterWriteBack(ctx);
+	assert.deepEqual(report.deleted, ['attachments/pic.png']);
+});
+
+test('Markdown backslash escapes in a link target still match the file name (pic\\(1\\).png → pic(1).png)', async () => {
+	const ctx = await setup();
+	const bytes = [5, 6, 7];
+	const image = ctx.app.vault.addBinary('attachments/pic(1).png', bytes);
+	await indexImage(ctx.index, ctx.settings, bytes, '/file/pic1.png');
+	ctx.uploaded = [{ file: image, src: '/file/pic1.png', url: 'http://img.example:7658/file/pic1.png' }];
+	ctx.app.vault.addText('notes/escaped.md', '![x](attachments/pic\\(1\\).png)');
+
+	const report = await runAfterWriteBack(ctx);
+
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic(1).png', reason: 'referenced' }]);
+	assert.deepEqual(ctx.app.trashed, []);
+});
+
+test('a note rewritten during remote verification with its mtime preserved is re-read, not served from cache', async () => {
+	let ctxRef = null;
+	const fetcher = createFetcher({
+		onCall: () => {
+			// 同步工具：内容变了、时间戳没变，但 modify 事件照常发出
+			const { app } = ctxRef;
+			const other = app.vault.getAbstractFileByPath('notes/other.md');
+			const mtime = other.stat.mtime;
+			app.vault.setText('notes/other.md', '![[pic.png]]');
+			other.stat.mtime = mtime;
+			app.vault.emit('modify', other);
+		}
+	});
+	const ctx = await setup({ fetcher });
+	ctxRef = ctx;
+	ctx.app.vault.addText('notes/other.md', 'nothing here yet');
+
+	const report = await runAfterWriteBack(ctx);
+
+	assert.deepEqual(report.kept, [{ path: 'attachments/pic.png', reason: 'referenced' }]);
+	assert.deepEqual(ctx.app.trashed, []);
+});
+
+test('the text cache does not survive between cleanup runs', async () => {
+	const ctx = await setup();
+	const other = ctx.app.vault.addText('notes/other.md', 'nothing here yet');
+	assert.deepEqual(await ctx.cleaner.findOrphans().then((list) => list.map((item) => item.file.path)), ['attachments/pic.png']);
+
+	// 两次运行之间内容变了，时间戳没变，也没有任何监听者在场
+	const mtime = other.stat.mtime;
+	ctx.app.vault.setText('notes/other.md', '![[pic.png]]');
+	other.stat.mtime = mtime;
+
+	assert.deepEqual(await ctx.cleaner.findOrphans(), []);
+	assert.equal(ctx.app.vault.listenerCount?.('modify') ?? 0, 0);
+});

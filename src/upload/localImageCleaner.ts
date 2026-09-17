@@ -82,7 +82,10 @@ interface FileStamp {
 export class LocalImageCleaner {
 	static resolveTimeoutMs = 15000;
 
-	private textCache = new Map<string, { mtime: number; text: string }>();
+	private textCache = new Map<string, { mtime: number; size: number; text: string }>();
+	/** 正在进行的清理批次数；>0 时订阅库事件让 textCache 失效，见 withFreshTextCache。 */
+	private activeRuns = 0;
+	private stopCacheInvalidation: (() => void) | null = null;
 	/** 插件卸载后置位：在途清理不再删除任何文件。 */
 	private disposed = false;
 
@@ -135,7 +138,11 @@ export class LocalImageCleaner {
 	}
 
 	/** 链接写回之后调用。 */
-	async cleanupAfterWriteBack(images: UploadedVaultImage[], sourceFile: TFile, waiter: ResolveWaiter): Promise<CleanupReport> {
+	cleanupAfterWriteBack(images: UploadedVaultImage[], sourceFile: TFile, waiter: ResolveWaiter): Promise<CleanupReport> {
+		return this.withFreshTextCache(() => this.runCleanupAfterWriteBack(images, sourceFile, waiter));
+	}
+
+	private async runCleanupAfterWriteBack(images: UploadedVaultImage[], sourceFile: TFile, waiter: ResolveWaiter): Promise<CleanupReport> {
 		const report: CleanupReport = { deleted: [], kept: [] };
 		try {
 			if (images.length === 0) {
@@ -167,7 +174,11 @@ export class LocalImageCleaner {
 	}
 
 	/** 孤立图片：库内图片文件，当前字节命中索引，且全库无引用。 */
-	async findOrphans(): Promise<UploadedVaultImage[]> {
+	findOrphans(): Promise<UploadedVaultImage[]> {
+		return this.withFreshTextCache(() => this.runFindOrphans());
+	}
+
+	private async runFindOrphans(): Promise<UploadedVaultImage[]> {
 		const orphans: UploadedVaultImage[] = [];
 		for (const file of this.app.vault.getFiles()) {
 			if (!IMAGE_EXTENSIONS.has(file.extension.toLowerCase())) {
@@ -186,7 +197,11 @@ export class LocalImageCleaner {
 	}
 
 	/** 用户在预览中确认后调用；每张图在真正删除前都会再完整核对一次。 */
-	async cleanupOrphans(images: UploadedVaultImage[]): Promise<CleanupReport> {
+	cleanupOrphans(images: UploadedVaultImage[]): Promise<CleanupReport> {
+		return this.withFreshTextCache(() => this.runCleanupOrphans(images));
+	}
+
+	private async runCleanupOrphans(images: UploadedVaultImage[]): Promise<CleanupReport> {
 		const report: CleanupReport = { deleted: [], kept: [] };
 		for (const image of images) {
 			// 孤立清理是用户显式确认的命令，不受「上传后删除」开关约束，但仍响应卸载信号
@@ -263,6 +278,39 @@ export class LocalImageCleaner {
 		} catch (error) {
 			console.error(`CF ImageBed: cleanup of ${path} failed:`, error);
 			report.kept.push({ path, reason: 'error' });
+		}
+	}
+
+	/**
+	 * textCache 只在一个清理批次内有效：批次开始时清空，批次期间任何库文件事件都让对应路径失效。
+	 * 只比较 mtime 不够——同步工具可能改了内容却保留时间戳，远端验证的网络等待期间新增的引用
+	 * 会被旧缓存漏掉，最终复核照样放行删除。
+	 */
+	private async withFreshTextCache<T>(run: () => Promise<T>): Promise<T> {
+		if (this.activeRuns++ === 0) {
+			this.textCache.clear();
+			const vault = this.app.vault as unknown as EventSource;
+			const refs = ['create', 'modify', 'delete', 'rename'].map((name) =>
+				vault.on(name, (file: unknown, oldPath: unknown) => {
+					const path = (file as { path?: string } | null)?.path;
+					if (path) {
+						this.textCache.delete(path);
+					}
+					if (typeof oldPath === 'string') {
+						this.textCache.delete(oldPath);
+					}
+				})
+			);
+			this.stopCacheInvalidation = () => refs.forEach((ref) => vault.offref(ref));
+		}
+		try {
+			return await run();
+		} finally {
+			if (--this.activeRuns === 0) {
+				this.stopCacheInvalidation?.();
+				this.stopCacheInvalidation = null;
+				this.textCache.clear();
+			}
 		}
 	}
 
@@ -407,8 +455,8 @@ export class LocalImageCleaner {
 	}
 
 	/**
-	 * 全库 Markdown + Canvas 文本，按 mtime 增量刷新：同一批清理里多张图共享一次读取，
-	 * 修改过的文件按需重读，不会误用过期内容。
+	 * 全库 Markdown + Canvas 文本：同一批清理里多张图共享一次读取；文件事件或 mtime/size 变化
+	 * 都会让对应条目失效并重读（见 withFreshTextCache），不会误用过期内容。
 	 */
 	private async getVaultTexts(): Promise<{ file: TFile; text: string }[]> {
 		const files = this.app.vault.getFiles().filter((file) => file.extension === 'md' || file.extension === 'canvas');
@@ -416,14 +464,17 @@ export class LocalImageCleaner {
 		const result: { file: TFile; text: string }[] = [];
 		for (const file of files) {
 			seen.add(file.path);
-			const mtime = file.stat?.mtime ?? 0;
+			const { mtime, size } = stampOf(file);
 			const cached = this.textCache.get(file.path);
-			if (cached && cached.mtime === mtime) {
+			if (cached && cached.mtime === mtime && cached.size === size) {
 				result.push({ file, text: cached.text });
 				continue;
 			}
 			const text = await this.app.vault.cachedRead(file);
-			this.textCache.set(file.path, { mtime, text });
+			// 读取期间该文件又变了（失效事件已触发）就不缓存这次结果
+			if (sameStamp(stampOf(file), { mtime, size })) {
+				this.textCache.set(file.path, { mtime, size, text });
+			}
 			result.push({ file, text });
 		}
 		for (const path of Array.from(this.textCache.keys())) {
@@ -585,12 +636,32 @@ export function mentionsLocalFile(text: string, fileName: string): boolean {
 		// 只剔除「目标为远程 URL 的图片」整体：alt 是纯文本，上传后 alt 里仍是原文件名。
 		// alt 含 < 或 [ 的不剔除；普通链接 [text](http…) 一律不剔除——链接文本里可能嵌着本地 <img>。
 		.replace(/!\[[^\]<[]*\]\(\s*<?https?:\/\/[^)]*\)/gi, ' ')
-		// 只剔除 src 属性本身为远程的 <img>（\s 保证是独立的 src，不匹配 data-src 等）
-		.replace(/<img\b(?=[^>]*\ssrc\s*=\s*["']?https?:)[^>]*>/gi, ' ')
+		// 只剔除「真正的 src 属性」为远程的 <img>。必须按属性逐个解析：alt="… src=https:…" 这种
+		// 属性值里的文字不是 src，否则整个标签被剔除，真正的本地 src 就漏掉了。
+		.replace(/<img\b[^>]*>/gi, (tag) => (hasRemoteImgSrc(tag) ? ' ' : tag))
 		// 裸 URL 只剔除 URL 本身，不动它周围的链接文本或嵌套内容
 		.replace(/https?:\/\/[^\s)>"'\]]+/gi, ' ');
 	const normalized = safeDecodePercent(decodeHtmlEntities(stripped)).toLowerCase();
 	const needle = safeDecodePercent(decodeHtmlEntities(fileName)).toLowerCase();
+	// Markdown 反斜杠转义：`pic\(1\).png` 引用的是 `pic(1).png`。原文与解转义后的文本都查，任一命中即算引用。
+	const unescaped = normalized.replace(/\\([!-/:-@[-`{-~])/g, '$1');
+	return containsFileName(normalized, needle) || (unescaped !== normalized && containsFileName(unescaped, needle));
+}
+
+/** <img …> 标签的 src 属性（按属性逐个解析，带引号的属性值整体跳过）是否为远程 URL。 */
+function hasRemoteImgSrc(tag: string): boolean {
+	const attributes = tag.replace(/^<img\b/i, '').replace(/\/?>$/, '');
+	const pattern = /([^\s"'=<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+	for (let match = pattern.exec(attributes); match; match = pattern.exec(attributes)) {
+		if (match[1].toLowerCase() === 'src') {
+			const value = (match[2] ?? match[3] ?? match[4] ?? '').trim();
+			return /^https?:/i.test(value);
+		}
+	}
+	return false;
+}
+
+function containsFileName(normalized: string, needle: string): boolean {
 	// 按文件名边界匹配：命中位置的前一个字符不能是文件名字符，否则 `shared.png` 会被当成
 	// 对 `red.png` 的引用（真实库验收中发现：保守方向的误判，会让图片永远清不掉）。
 	let from = 0;
