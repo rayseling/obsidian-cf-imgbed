@@ -15,6 +15,7 @@ export class Notice { constructor(message) { (globalThis.__notices ??= []).push(
 export class MarkdownView {}
 export const Platform = { isMobile: false };
 export const requestUrl = () => { throw new Error('network disabled in test'); };
+export const htmlToMarkdown = (html) => html;
 `;
 const stubObsidian = {
 	name: 'stub-obsidian',

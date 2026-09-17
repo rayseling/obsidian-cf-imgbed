@@ -1,4 +1,4 @@
-import { App, Editor, MarkdownView, Notice, Platform, TFile, requestUrl } from 'obsidian';
+import { App, Editor, MarkdownView, Notice, Platform, TFile, htmlToMarkdown, requestUrl } from 'obsidian';
 import { CFImageBedSettings } from '../types';
 import { UploadService } from './uploadService';
 import { I18n } from '../utils/i18n';
@@ -14,6 +14,13 @@ import { getEffectiveExcludedDomains, isUrlExcluded } from '../utils/domainUtils
 import { LocalImageCleaner, UploadedVaultImage } from './localImageCleaner';
 import { isAutoUploadActiveFor } from '../utils/autoUploadScope';
 import { sniffImageMimeType } from '../utils/imageSniffer';
+
+/** 异步上传的落点：发起时插入的占位符，完成后只替换它。 */
+interface PendingInsertion {
+	editor: Editor;
+	noteFile: TFile | null;
+	placeholder: string;
+}
 
 interface TextReplacement {
 	index: number;
@@ -162,17 +169,14 @@ export class ImageHandler {
 			new Notice(this.i18n?.t('notices.uploadingRemoteImages') || 'Uploading remote images...');
 		}
 
-		const handled = await this.handleRemoteClipboardContent(
+		await this.handleRemoteClipboardContent(
 			editor,
 			text,
 			markdownRefs,
 			urlRefs,
-			htmlImages
+			htmlImages,
+			clipboardData.getData('text/html') || ''
 		);
-
-		if (!handled && text) {
-			editor.replaceSelection(text);
-		}
 	}
 
 	async uploadCurrentNoteImages(): Promise<void> {
@@ -506,14 +510,26 @@ export class ImageHandler {
 			new Notice(this.i18n?.t('notices.uploadingImage') || 'Uploading image...');
 		}
 
+		// 上传是异步的：先在发起位置插入占位符，完成后只替换占位符。
+		// 直接在完成时 replaceSelection 会覆盖用户上传期间新选中的文字，或插到别的位置。
+		const target: PendingInsertion = {
+			editor: targetEditor,
+			noteFile,
+			placeholder: this.insertUploadPlaceholder(targetEditor, file.name)
+		};
+
 		const imageUrl = await this.uploadService.uploadImage(file, { noteFile });
 		if (!imageUrl) {
 			// 粘贴/拖入的图片只存在于内存里，上传失败会直接丢图：暂存到附件目录并插入本地链接，之后再补传
-			await this.stashFailedUpload(file, targetEditor, noteFile);
+			await this.stashFailedUpload(file, target);
 			return;
 		}
 
-		targetEditor.replaceSelection(this.buildMarkdownImage(file.name, imageUrl, file.name));
+		const placed = await this.resolveUploadPlaceholder(target, this.buildMarkdownImage(file.name, imageUrl, file.name));
+		if (!placed) {
+			this.notifyPlaceholderLost(imageUrl);
+			return;
+		}
 		if (settings?.showSuccessNotification) {
 			new Notice(
 				this.i18n?.t('notices.uploadSuccess', { url: imageUrl }) || `Image uploaded successfully: ${imageUrl}`,
@@ -527,7 +543,8 @@ export class ImageHandler {
 	 * 若自动上云已开启且目标笔记在监听范围内，会提示稍后自动补传；否则提示需手动处理。
 	 * 暂存本身失败时明确报错，绝不显示成功。
 	 */
-	private async stashFailedUpload(file: File, editor: Editor, noteFile: TFile | null): Promise<void> {
+	private async stashFailedUpload(file: File, target: PendingInsertion): Promise<void> {
+		const { noteFile } = target;
 		const settings = this.getSettings?.();
 		const duration = (settings?.notificationDuration ?? 5) * 1000;
 		try {
@@ -535,7 +552,7 @@ export class ImageHandler {
 			const targetPath = await this.app.fileManager.getAvailablePathForAttachment(fileName, noteFile?.path ?? '');
 			const created = await this.app.vault.createBinary(targetPath, await file.arrayBuffer());
 			const link = this.app.fileManager.generateMarkdownLink(created, noteFile?.path ?? '');
-			editor.replaceSelection(link.startsWith('!') ? link : `!${link}`);
+			await this.resolveUploadPlaceholder(target, link.startsWith('!') ? link : `!${link}`);
 
 			const willAutoRetry = Boolean(settings && noteFile && isAutoUploadActiveFor(settings, noteFile.path));
 			new Notice(
@@ -547,6 +564,7 @@ export class ImageHandler {
 				duration
 			);
 		} catch (error) {
+			await this.resolveUploadPlaceholder(target, '');
 			console.error('CF ImageBed: failed to stash image after upload failure:', error);
 			new Notice(
 				this.i18n?.t('notices.uploadFailedStashFailed') || 'Upload failed and the image could not be saved locally',
@@ -575,37 +593,48 @@ export class ImageHandler {
 		text: string,
 		markdownRefs: ParsedImageReference[],
 		urlRefs: ParsedImageReference[],
-		htmlImages: ClipboardHtmlImage[]
-	): Promise<boolean> {
+		htmlImages: ClipboardHtmlImage[],
+		html: string
+	): Promise<void> {
 		const noteFile = this.app.workspace.getActiveFile();
-
-		if (markdownRefs.length > 0) {
-			const { updatedText, successCount, failedCount } = await this.replaceRemoteReferencesInText(
-				text,
-				markdownRefs,
-				noteFile
-			);
-			editor.replaceSelection(updatedText);
+		// 转存是异步的：先占位，完成后只替换占位符，不碰用户期间的新选区
+		const target: PendingInsertion = {
+			editor,
+			noteFile,
+			placeholder: this.insertUploadPlaceholder(editor, 'remote images')
+		};
+		const finish = async (content: string, successCount: number, failedCount: number): Promise<void> => {
+			if (!(await this.resolveUploadPlaceholder(target, content))) {
+				this.notifyPlaceholderLost(content);
+				return;
+			}
 			this.showRemotePasteSummary(successCount, failedCount);
-			return true;
-		}
+		};
 
-		if (urlRefs.length > 0) {
-			const { updatedText, successCount, failedCount } = await this.replaceRemoteReferencesInText(
-				text,
-				urlRefs,
-				noteFile
-			);
-			editor.replaceSelection(updatedText);
-			this.showRemotePasteSummary(successCount, failedCount);
-			return true;
-		}
+		try {
+			const textRefs = markdownRefs.length > 0 ? markdownRefs : urlRefs;
+			if (textRefs.length > 0) {
+				const result = await this.replaceRemoteReferencesInText(text, textRefs, noteFile);
+				await finish(result.updatedText, result.successCount, result.failedCount);
+				return;
+			}
 
-		if (htmlImages.length > 0) {
-			const insertedLines: string[] = [];
+			// 富文本（网页 / 文档）：整段转成 Markdown 再替换其中的图片，保留正文；
+			// 只插入图片链接会把剪贴板里的正文丢掉。
+			const markdown = html ? this.convertClipboardHtml(html) : '';
+			const excludedDomains = this.getExcludedDomains(this.getSettings?.());
+			const convertedRefs = extractMarkdownAndWikiImageReferences(markdown)
+				.filter((ref) => ref.isRemote)
+				.filter((ref) => !this.isExcludedRemoteUrl(ref.path, excludedDomains));
+			if (convertedRefs.length > 0) {
+				const result = await this.replaceRemoteReferencesInText(markdown, convertedRefs, noteFile);
+				await finish(result.updatedText, result.successCount, result.failedCount);
+				return;
+			}
+
+			const insertedLines: string[] = text.trim() ? [text] : [];
 			let successCount = 0;
 			let failedCount = 0;
-
 			for (const image of htmlImages) {
 				const uploadedUrl = await this.uploadRemoteImage(image.url, image.altText, noteFile);
 				if (uploadedUrl) {
@@ -616,13 +645,80 @@ export class ImageHandler {
 					failedCount++;
 				}
 			}
+			await finish(insertedLines.join('\n'), successCount, failedCount);
+		} catch (error) {
+			// 粘贴已被我们接管：出错也要把原始文本还给用户，不能只留下占位符
+			console.error('CF ImageBed: remote paste failed:', error);
+			await this.resolveUploadPlaceholder(target, text);
+		}
+	}
 
-			editor.replaceSelection(insertedLines.join('\n'));
-			this.showRemotePasteSummary(successCount, failedCount);
+	private convertClipboardHtml(html: string): string {
+		try {
+			return htmlToMarkdown(html).trim();
+		} catch (error) {
+			console.warn('CF ImageBed: failed to convert clipboard HTML to Markdown:', error);
+			return '';
+		}
+	}
+
+	private insertUploadPlaceholder(editor: Editor, label: string): string {
+		const id = Math.random().toString(36).slice(2, 8);
+		const placeholder = `![⏳ ${this.escapeMarkdownText(label) || 'image'} ${id}]()`;
+		editor.replaceSelection(placeholder);
+		return placeholder;
+	}
+
+	/**
+	 * 把占位符替换成最终内容。编辑器仍打开时改编辑器；笔记已关闭 / 切走时改磁盘上的笔记。
+	 * 返回 false 表示占位符已不存在（多半是用户删掉了），调用方不应再往光标处插入。
+	 */
+	private async resolveUploadPlaceholder(target: PendingInsertion, replacement: string): Promise<boolean> {
+		const { editor, noteFile, placeholder } = target;
+		if (this.isEditorAttached(editor)) {
+			const index = editor.getValue().indexOf(placeholder);
+			if (index < 0) {
+				return false;
+			}
+			editor.replaceRange(replacement, editor.offsetToPos(index), editor.offsetToPos(index + placeholder.length));
 			return true;
 		}
 
-		return false;
+		if (!noteFile || typeof this.app.vault?.process !== 'function') {
+			return false;
+		}
+		let replaced = false;
+		try {
+			await this.app.vault.process(noteFile, (content) => {
+				const index = content.indexOf(placeholder);
+				if (index < 0) {
+					return content;
+				}
+				replaced = true;
+				return content.slice(0, index) + replacement + content.slice(index + placeholder.length);
+			});
+		} catch (error) {
+			console.warn('CF ImageBed: failed to resolve upload placeholder on disk:', error);
+		}
+		return replaced;
+	}
+
+	/** 编辑器所属的视图是否还开着；关掉后的 Editor 对象仍可读写，但写入不会落到任何笔记里。 */
+	private isEditorAttached(editor: Editor): boolean {
+		const workspace = this.app.workspace;
+		if (typeof workspace?.getLeavesOfType !== 'function') {
+			return true;
+		}
+		return workspace.getLeavesOfType('markdown').some((leaf) => (leaf.view as MarkdownView)?.editor === editor);
+	}
+
+	private notifyPlaceholderLost(content: string): void {
+		const duration = (this.getSettings?.()?.notificationDuration ?? 5) * 1000;
+		new Notice(
+			this.i18n?.t('notices.uploadPlaceholderLost', { content })
+			|| `Upload finished but its placeholder is gone, nothing was inserted: ${content}`,
+			duration
+		);
 	}
 
 	private async replaceRemoteReferencesInText(

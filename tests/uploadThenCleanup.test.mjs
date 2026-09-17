@@ -20,6 +20,7 @@ export class MarkdownView { constructor(content) { this.editor = { getValue: () 
 export class Notice { constructor(message) { (globalThis.__notices ??= []).push(String(message)); } }
 export const Platform = { isMobile: false };
 export const requestUrl = () => { throw new Error('requestUrl must be injected'); };
+export const htmlToMarkdown = (html) => html;
 `;
 const stubObsidian = {
 	name: 'stub-obsidian',

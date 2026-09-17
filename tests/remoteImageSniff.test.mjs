@@ -16,6 +16,7 @@ export class Notice { constructor() {} }
 export class MarkdownView {}
 export const Platform = { isMobile: false };
 export const requestUrl = (...args) => globalThis.__requestUrl(...args);
+export const htmlToMarkdown = (html) => html;
 `;
 const stubObsidian = {
 	name: 'stub-obsidian',
