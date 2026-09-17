@@ -108,18 +108,18 @@ export class ExcalidrawSceneUploadTracker {
 				return;
 			}
 
-			const sceneElements = view.getScene?.()?.elements ?? [];
-			const currentElements = sceneElements.filter((element) =>
-				isImageElement(element) && element.fileId === sourceFileId
-			);
-			if (currentElements.length === 0) {
+			const findCurrentElements = (): ExcalidrawImageElement[] =>
+				(view.getScene?.()?.elements ?? []).filter((element) =>
+					isImageElement(element) && element.fileId === sourceFileId
+				) as ExcalidrawImageElement[];
+			if (findCurrentElements().length === 0) {
 				return;
 			}
 
 			ea.setView(view);
 			ea.clear();
 			try {
-				const firstElement = currentElements[0];
+				const firstElement = findCurrentElements()[0];
 				const temporaryId = await ea.addImage(firstElement.x ?? 0, firstElement.y ?? 0, imageUrl);
 				if (!temporaryId) {
 					throw new Error('Failed to load the uploaded Excalidraw image');
@@ -132,7 +132,13 @@ export class ExcalidrawSceneUploadTracker {
 				}
 
 				delete ea.elementsDict[temporaryId];
-				ea.copyViewElementsToEAforEditing(currentElements as ExcalidrawImageElement[]);
+				// addImage 要下载远程图片，期间用户可能移动 / 删除了图片：
+				// 必须重新读取当前场景，提交旧快照会覆盖这些编辑、复活已删除的图片。
+				const currentElements = findCurrentElements();
+				if (currentElements.length === 0) {
+					return;
+				}
+				ea.copyViewElementsToEAforEditing(currentElements);
 				for (const element of currentElements) {
 					const editableElement = ea.getElement(element.id);
 					if (editableElement) {

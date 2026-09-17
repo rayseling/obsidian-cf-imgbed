@@ -304,6 +304,59 @@ test('new image inserted by Excalidraw is uploaded and replaced with the remote 
 	}
 });
 
+/** 触发一次「Excalidraw 原生插入图片」，并在远程图片加载（ea.addImage）期间执行 duringLoad 模拟用户编辑。 */
+async function replaceNativeImageWhile(context, duringLoad) {
+	const nativeFile = { id: 'native-file', mimeType: 'image/png', dataURL: 'data:image/png;base64,AA==' };
+	context.view.scene = {
+		elements: [{ id: 'native-image', type: 'image', fileId: 'native-file', x: 5, y: 6 }],
+		files: { 'native-file': nativeFile }
+	};
+	const addImage = context.automate.addImage.bind(context.automate);
+	context.automate.addImage = async (...args) => {
+		duringLoad();
+		return addImage(...args);
+	};
+	context.automate.onSceneChangeHook.callback(
+		context.view.scene.elements,
+		{},
+		context.view.scene.files,
+		context.view,
+		context.automate
+	);
+	await flushQueue();
+}
+
+test('an image moved while the uploaded file loads keeps its new position', async () => {
+	const context = setup(true);
+	try {
+		await replaceNativeImageWhile(context, () => {
+			context.view.scene = {
+				...context.view.scene,
+				elements: [{ id: 'native-image', type: 'image', fileId: 'native-file', x: 500, y: 600 }]
+			};
+		});
+		const replaced = context.view.scene.elements.find((element) => element.id === 'native-image');
+		assert.match(replaced.fileId, /^remote-/);
+		assert.equal(replaced.x, 500);
+		assert.equal(replaced.y, 600);
+	} finally {
+		context.cleanup();
+	}
+});
+
+test('an image deleted while the uploaded file loads is not resurrected', async () => {
+	const context = setup(true);
+	try {
+		await replaceNativeImageWhile(context, () => {
+			context.view.scene = { ...context.view.scene, elements: [] };
+		});
+		assert.deepEqual(context.view.scene.elements, []);
+		assert.equal(context.automate.commits.length, 0);
+	} finally {
+		context.cleanup();
+	}
+});
+
 test('external image dragover enables dropping only while takeover is enabled', () => {
 	const enabledContext = setup(true);
 	try {
